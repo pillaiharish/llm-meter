@@ -77,7 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
         "inspect",
         help="Inspect a resolved workload specification",
     )
-    inspect_parser.add_argument("--tokenizer", default="fake", help="Tokenizer ID (default: fake)")
+    inspect_parser.add_argument(
+        "--tokenizer", required=True, help="Tokenizer ID (Hugging Face model id)"
+    )
     inspect_parser.add_argument(
         "--input-tokens", type=int, required=True, help="Target input token count"
     )
@@ -116,7 +118,7 @@ def _build_workload_provenance(
         seed=request_spec.workload_seed,
         input_tokens_target=request_spec.input_tokens_target,
         output_tokens_target=request_spec.max_output_tokens,
-        input_tokens_actual_local=request_spec.input_tokens_actual,
+        input_tokens_actual_local=request_spec.input_tokens_actual_local,
         resolution_status=request_spec.resolution_status.value,
         prompt_sha256=request_spec.prompt_sha256,
         prompt_chars=request_spec.prompt_chars,
@@ -126,15 +128,24 @@ def _build_workload_provenance(
     )
 
 
-def _resolve_prompt(args: argparse.Namespace) -> tuple[str, RequestSpec, str]:
+def _validate_cli_inputs(args: argparse.Namespace) -> None:
     if args.prompt is not None and args.input_tokens is not None:
         _fail("--prompt and --input-tokens are mutually exclusive")
 
+    if args.max_output_tokens is not None and args.max_output_tokens <= 0:
+        _fail("--max-output-tokens must be positive")
+
+    if args.input_tokens is not None and args.input_tokens <= 0:
+        _fail("--input-tokens must be positive")
+
+
+def _resolve_prompt(args: argparse.Namespace) -> tuple[str, RequestSpec, str]:
+    _validate_cli_inputs(args)
+
     if args.prompt is not None:
-        output_target = args.max_output_tokens or 1
         spec = WorkloadSpec(
-            input_tokens_target=0,
-            output_tokens_target=output_target,
+            input_tokens_target=None,
+            output_tokens_target=args.max_output_tokens,
             seed=args.seed,
             prompt_source=PromptSource.MANUAL.value,
             tokenizer_id=args.tokenizer,
@@ -146,12 +157,11 @@ def _resolve_prompt(args: argparse.Namespace) -> tuple[str, RequestSpec, str]:
     if args.input_tokens is not None:
         if not args.tokenizer:
             _fail("--input-tokens requires --tokenizer")
-        output_target = args.max_output_tokens or 0
-        if output_target <= 0:
+        if args.max_output_tokens is None:
             _fail("--max-output-tokens is required with --input-tokens")
         spec = WorkloadSpec(
             input_tokens_target=args.input_tokens,
-            output_tokens_target=output_target,
+            output_tokens_target=args.max_output_tokens,
             seed=args.seed,
             prompt_source=PromptSource.BUILTIN.value,
             tokenizer_id=args.tokenizer,
@@ -220,9 +230,9 @@ def _run_one(args: argparse.Namespace) -> int:
 
 def _workload_inspect(args: argparse.Namespace) -> int:
     if args.input_tokens <= 0:
-        raise SystemExit("error: --input-tokens must be positive")
+        _fail("--input-tokens must be positive")
     if args.output_tokens <= 0:
-        raise SystemExit("error: --output-tokens must be positive")
+        _fail("--output-tokens must be positive")
 
     spec = WorkloadSpec(
         input_tokens_target=args.input_tokens,
@@ -236,7 +246,7 @@ def _workload_inspect(args: argparse.Namespace) -> int:
 
     print("source:                builtin")
     print(f"input_tokens_target:   {request_spec.input_tokens_target}")
-    print(f"input_tokens_actual:   {request_spec.input_tokens_actual}")
+    print(f"input_tokens_actual:   {request_spec.input_tokens_actual_local}")
     print(f"resolution:            {request_spec.resolution_status.value}")
     print(f"output_tokens_target:  {request_spec.max_output_tokens}")
     if request_spec.tokenizer_provenance:

@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from llm_meter.tokenizer import FakeTokenizer, TokenizerProvenance, load_tokenizer
+from unittest.mock import MagicMock, patch
+
+from llm_meter.tokenizer import (
+    FakeTokenizer,
+    HuggingFaceTokenizer,
+    TokenizerProvenance,
+    load_tokenizer,
+)
 
 
 def test_fake_tokenizer_encode_decode_roundtrip() -> None:
@@ -73,3 +80,86 @@ def test_load_tokenizer_fake_prefix() -> None:
 def test_load_tokenizer_none() -> None:
     tok = load_tokenizer(None)
     assert tok is None
+
+
+def _make_mock_hf_tokenizer() -> MagicMock:
+    mock_tok = MagicMock()
+    mock_encoding = MagicMock()
+    mock_encoding.ids = [1, 2, 3]
+    mock_tok.encode.return_value = mock_encoding
+    mock_tok.decode.return_value = "decoded text"
+    return mock_tok
+
+
+def test_hf_tokenizer_id_forwarded() -> None:
+    with patch("tokenizers.Tokenizer.from_pretrained", return_value=_make_mock_hf_tokenizer()):
+        tok = HuggingFaceTokenizer(tokenizer_id="Qwen/Qwen3-8B")
+        prov = tok.provenance()
+        assert prov.provider == "huggingface"
+        assert prov.tokenizer_id == "Qwen/Qwen3-8B"
+
+
+def test_hf_tokenizer_explicit_revision_forwarded() -> None:
+    with patch(
+        "tokenizers.Tokenizer.from_pretrained",
+        return_value=_make_mock_hf_tokenizer(),
+    ) as mock_fp:
+        HuggingFaceTokenizer(tokenizer_id="Qwen/Qwen3-8B", revision="abc123")
+        mock_fp.assert_called_once_with("Qwen/Qwen3-8B", revision="abc123")
+
+
+def test_hf_tokenizer_revision_none_preserved() -> None:
+    with patch(
+        "tokenizers.Tokenizer.from_pretrained",
+        return_value=_make_mock_hf_tokenizer(),
+    ) as mock_fp:
+        tok = HuggingFaceTokenizer(tokenizer_id="Qwen/Qwen3-8B", revision=None)
+        mock_fp.assert_called_once_with("Qwen/Qwen3-8B", revision=None)
+        assert tok.provenance().revision is None
+
+
+def test_hf_tokenizer_encode_forwards_add_special_tokens_false() -> None:
+    mock_tok = _make_mock_hf_tokenizer()
+    with patch("tokenizers.Tokenizer.from_pretrained", return_value=mock_tok):
+        tok = HuggingFaceTokenizer(tokenizer_id="Qwen/Qwen3-8B")
+        ids = tok.encode("hello world", add_special_tokens=False)
+        mock_tok.encode.assert_called_once_with("hello world", add_special_tokens=False)
+        assert ids == [1, 2, 3]
+        assert isinstance(ids, list)
+
+
+def test_hf_tokenizer_encode_returns_list_of_int() -> None:
+    mock_tok = _make_mock_hf_tokenizer()
+    mock_tok.encode.return_value.ids = [10, 20, 30]
+    with patch("tokenizers.Tokenizer.from_pretrained", return_value=mock_tok):
+        tok = HuggingFaceTokenizer(tokenizer_id="Qwen/Qwen3-8B")
+        ids = tok.encode("test")
+        assert ids == [10, 20, 30]
+        assert all(isinstance(i, int) for i in ids)
+
+
+def test_hf_tokenizer_decode_delegates() -> None:
+    mock_tok = _make_mock_hf_tokenizer()
+    mock_tok.decode.return_value = "hello decoded"
+    with patch("tokenizers.Tokenizer.from_pretrained", return_value=mock_tok):
+        tok = HuggingFaceTokenizer(tokenizer_id="Qwen/Qwen3-8B")
+        result = tok.decode([1, 2, 3])
+        mock_tok.decode.assert_called_once_with([1, 2, 3])
+        assert result == "hello decoded"
+
+
+def test_hf_tokenizer_provenance_fields() -> None:
+    with patch("tokenizers.Tokenizer.from_pretrained", return_value=_make_mock_hf_tokenizer()):
+        tok = HuggingFaceTokenizer(tokenizer_id="Qwen/Qwen3-8B", revision="main")
+        prov = tok.provenance()
+        assert prov.provider == "huggingface"
+        assert prov.tokenizer_id == "Qwen/Qwen3-8B"
+        assert prov.revision == "main"
+
+
+def test_load_tokenizer_huggingface_with_mock() -> None:
+    with patch("tokenizers.Tokenizer.from_pretrained", return_value=_make_mock_hf_tokenizer()):
+        tok = load_tokenizer("Qwen/Qwen3-8B")
+        assert tok is not None
+        assert isinstance(tok, HuggingFaceTokenizer)
+        assert tok.provenance().provider == "huggingface"

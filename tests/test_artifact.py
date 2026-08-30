@@ -567,10 +567,10 @@ def test_local_count_and_server_input_tokens_differ_and_survive() -> None:
     wl = WorkloadProvenance(
         source="manual",
         seed=0,
-        input_tokens_target=0,
+        input_tokens_target=None,
         output_tokens_target=64,
         input_tokens_actual_local=7,
-        resolution_status="nearest",
+        resolution_status="not_applicable",
         prompt_sha256="a" * 64,
         prompt_chars=7,
         tokenizer_provider="fake",
@@ -625,3 +625,48 @@ def test_workload_none_default_in_build_run() -> None:
         observations=observations,
     )
     assert run.workload is None
+
+
+def test_manual_workload_nullable_targets_round_trip() -> None:
+    wl = WorkloadProvenance(
+        source="manual",
+        seed=0,
+        input_tokens_target=None,
+        output_tokens_target=None,
+        input_tokens_actual_local=7,
+        resolution_status="not_applicable",
+        prompt_sha256="b" * 64,
+        prompt_chars=7,
+        tokenizer_provider="fake",
+        tokenizer_id="fake-test",
+        tokenizer_revision=None,
+    )
+    configuration = RunConfiguration(
+        endpoint="http://localhost:8000/v1",
+        model="test-model",
+        streaming=True,
+        max_output_tokens=None,
+    )
+    observations = RawObservations(
+        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
+        stream_events=[],
+        completion=Completion(offset_ns=100_000_000, wall_clock_utc="2025-01-01T00:00:01Z"),
+        usage=Usage(input_tokens=15, output_tokens=2, source=TokenCountSource.SERVER_REPORTED),
+    )
+    run = build_run(
+        run_id="nullable-run",
+        started_at="2025-01-01T00:00:00Z",
+        configuration=configuration,
+        observations=observations,
+        workload=wl,
+    )
+
+    json_str = to_json(run)
+    data = json.loads(json_str)
+    assert data["workload"]["input_tokens_target"] is None
+    assert data["workload"]["output_tokens_target"] is None
+
+    restored = from_json(json_str)
+    assert restored.workload is not None
+    assert restored.workload.input_tokens_target is None
+    assert restored.workload.output_tokens_target is None

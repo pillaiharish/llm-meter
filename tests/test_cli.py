@@ -17,20 +17,8 @@ from llm_meter.models import (
 )
 
 
-def test_run_one_help(capsys: object) -> None:
-    try:
-        main(["run-one", "--help"])
-    except SystemExit as exc:
-        assert exc.code == 0
-    captured = capsys.readouterr()
-    assert "run-one" in captured.out
-    assert "--endpoint" in captured.out
-    assert "--model" in captured.out
-    assert "--prompt" in captured.out
-
-
-def test_run_one_produces_artifact(tmp_path: Path, capsys: object) -> None:
-    fake_observations = RawObservations(
+def _fake_observations() -> RawObservations:
+    return RawObservations(
         request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
         stream_events=[
             StreamEvent(
@@ -50,9 +38,23 @@ def test_run_one_produces_artifact(tmp_path: Path, capsys: object) -> None:
         usage=Usage(input_tokens=3, output_tokens=5, source=TokenCountSource.SERVER_REPORTED),
     )
 
+
+def test_run_one_help(capsys: object) -> None:
+    try:
+        main(["run-one", "--help"])
+    except SystemExit as exc:
+        assert exc.code == 0
+    captured = capsys.readouterr()
+    assert "run-one" in captured.out
+    assert "--endpoint" in captured.out
+    assert "--model" in captured.out
+    assert "--prompt" in captured.out
+
+
+def test_run_one_produces_artifact(tmp_path: Path, capsys: object) -> None:
     output_file = tmp_path / "run.json"
 
-    with patch("llm_meter.cli.stream_completion", return_value=fake_observations):
+    with patch("llm_meter.cli.stream_completion", return_value=_fake_observations()):
         exit_code = main([
             "run-one",
             "--endpoint", "http://localhost:8000/v1",
@@ -76,9 +78,6 @@ def test_run_one_produces_artifact(tmp_path: Path, capsys: object) -> None:
     assert data["metrics"]["e2e_latency_ns"] == 30_000_000
     assert data["error"] is None
     assert data["run_status"] == "completed"
-    assert data["response_established"] is None or isinstance(
-        data["response_established"], dict
-    )
     assert "prompt" not in data
 
     captured = capsys.readouterr()
@@ -92,7 +91,7 @@ def test_run_one_produces_artifact(tmp_path: Path, capsys: object) -> None:
 def test_run_one_error_exit_code(tmp_path: Path, capsys: object) -> None:
     from llm_meter.models import ErrorObservation
 
-    fake_observations = RawObservations(
+    fake_obs = RawObservations(
         request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
         stream_events=[],
         error=ErrorObservation(
@@ -106,7 +105,7 @@ def test_run_one_error_exit_code(tmp_path: Path, capsys: object) -> None:
 
     output_file = tmp_path / "error_run.json"
 
-    with patch("llm_meter.cli.stream_completion", return_value=fake_observations):
+    with patch("llm_meter.cli.stream_completion", return_value=fake_obs):
         exit_code = main([
             "run-one",
             "--endpoint", "http://localhost:8000/v1",
@@ -174,30 +173,22 @@ def test_workload_inspect_show_prompt(capsys: object) -> None:
     assert "--- prompt ---" in captured.out
 
 
-def test_run_one_with_input_tokens(tmp_path: Path, capsys: object) -> None:
-    fake_observations = RawObservations(
-        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
-        stream_events=[
-            StreamEvent(
-                sequence=0,
-                offset_ns=10_000_000,
-                event_type="content",
-                text_delta="Hello",
-            ),
-            StreamEvent(
-                sequence=1,
-                offset_ns=20_000_000,
-                event_type="metadata",
-                finish_reason="stop",
-            ),
-        ],
-        completion=Completion(offset_ns=30_000_000, wall_clock_utc="2025-01-01T00:00:01Z"),
-        usage=Usage(input_tokens=50, output_tokens=5, source=TokenCountSource.SERVER_REPORTED),
-    )
+def test_workload_inspect_requires_tokenizer(capsys: object) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main([
+            "workload", "inspect",
+            "--input-tokens", "50",
+            "--output-tokens", "64",
+        ])
+    assert exc_info.value.code != 0
+    captured = capsys.readouterr()
+    assert "--tokenizer" in captured.err
 
+
+def test_run_one_with_input_tokens(tmp_path: Path, capsys: object) -> None:
     output_file = tmp_path / "run_input_tokens.json"
 
-    with patch("llm_meter.cli.stream_completion", return_value=fake_observations):
+    with patch("llm_meter.cli.stream_completion", return_value=_fake_observations()):
         exit_code = main([
             "run-one",
             "--endpoint", "http://localhost:8000/v1",
@@ -274,29 +265,9 @@ def test_run_one_neither_prompt_nor_input_tokens_rejected(tmp_path: Path, capsys
 
 
 def test_run_one_manual_prompt_with_tokenizer(tmp_path: Path, capsys: object) -> None:
-    fake_observations = RawObservations(
-        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
-        stream_events=[
-            StreamEvent(
-                sequence=0,
-                offset_ns=10_000_000,
-                event_type="content",
-                text_delta="Hello",
-            ),
-            StreamEvent(
-                sequence=1,
-                offset_ns=20_000_000,
-                event_type="metadata",
-                finish_reason="stop",
-            ),
-        ],
-        completion=Completion(offset_ns=30_000_000, wall_clock_utc="2025-01-01T00:00:01Z"),
-        usage=Usage(input_tokens=5, output_tokens=5, source=TokenCountSource.SERVER_REPORTED),
-    )
-
     output_file = tmp_path / "manual_with_tok.json"
 
-    with patch("llm_meter.cli.stream_completion", return_value=fake_observations):
+    with patch("llm_meter.cli.stream_completion", return_value=_fake_observations()):
         exit_code = main([
             "run-one",
             "--endpoint", "http://localhost:8000/v1",
@@ -312,32 +283,15 @@ def test_run_one_manual_prompt_with_tokenizer(tmp_path: Path, capsys: object) ->
     assert data["workload"]["source"] == "manual"
     assert data["workload"]["input_tokens_actual_local"] == 11
     assert data["workload"]["tokenizer_provider"] == "fake"
+    assert data["workload"]["resolution_status"] == "not_applicable"
+    assert data["workload"]["input_tokens_target"] is None
+    assert data["workload"]["output_tokens_target"] == 64
 
 
 def test_run_one_manual_prompt_without_tokenizer(tmp_path: Path, capsys: object) -> None:
-    fake_observations = RawObservations(
-        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
-        stream_events=[
-            StreamEvent(
-                sequence=0,
-                offset_ns=10_000_000,
-                event_type="content",
-                text_delta="Hello",
-            ),
-            StreamEvent(
-                sequence=1,
-                offset_ns=20_000_000,
-                event_type="metadata",
-                finish_reason="stop",
-            ),
-        ],
-        completion=Completion(offset_ns=30_000_000, wall_clock_utc="2025-01-01T00:00:01Z"),
-        usage=Usage(input_tokens=5, output_tokens=5, source=TokenCountSource.SERVER_REPORTED),
-    )
-
     output_file = tmp_path / "manual_no_tok.json"
 
-    with patch("llm_meter.cli.stream_completion", return_value=fake_observations):
+    with patch("llm_meter.cli.stream_completion", return_value=_fake_observations()):
         exit_code = main([
             "run-one",
             "--endpoint", "http://localhost:8000/v1",
@@ -356,10 +310,33 @@ def test_run_one_manual_prompt_without_tokenizer(tmp_path: Path, capsys: object)
     assert data["workload"]["tokenizer_revision"] is None
     assert data["workload"]["prompt_sha256"] != ""
     assert data["workload"]["prompt_chars"] == 11
+    assert data["workload"]["resolution_status"] == "not_applicable"
+    assert data["workload"]["input_tokens_target"] is None
+
+
+def test_run_one_manual_prompt_without_max_output(tmp_path: Path, capsys: object) -> None:
+    output_file = tmp_path / "manual_no_max.json"
+
+    with patch("llm_meter.cli.stream_completion", return_value=_fake_observations()):
+        exit_code = main([
+            "run-one",
+            "--endpoint", "http://localhost:8000/v1",
+            "--model", "test-model",
+            "--prompt", "hello world",
+            "--output", str(output_file),
+        ])
+
+    assert exit_code == 0
+    data = json.loads(output_file.read_text())
+    assert data["workload"]["source"] == "manual"
+    assert data["workload"]["output_tokens_target"] is None
+    assert data["workload"]["input_tokens_target"] is None
+    assert data["workload"]["resolution_status"] == "not_applicable"
+    assert data["configuration"]["max_output_tokens"] is None
 
 
 def test_run_one_local_and_server_input_tokens_differ(tmp_path: Path, capsys: object) -> None:
-    fake_observations = RawObservations(
+    fake_obs = RawObservations(
         request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
         stream_events=[
             StreamEvent(
@@ -381,7 +358,7 @@ def test_run_one_local_and_server_input_tokens_differ(tmp_path: Path, capsys: ob
 
     output_file = tmp_path / "differ_tokens.json"
 
-    with patch("llm_meter.cli.stream_completion", return_value=fake_observations):
+    with patch("llm_meter.cli.stream_completion", return_value=fake_obs):
         exit_code = main([
             "run-one",
             "--endpoint", "http://localhost:8000/v1",
@@ -397,3 +374,49 @@ def test_run_one_local_and_server_input_tokens_differ(tmp_path: Path, capsys: ob
     data = json.loads(output_file.read_text())
     assert data["workload"]["input_tokens_actual_local"] is not None
     assert data["usage"]["input_tokens"] == 50
+
+
+def test_run_one_input_tokens_zero_rejected_before_request(tmp_path: Path, capsys: object) -> None:
+    output_file = tmp_path / "should_not_exist.json"
+    with patch("llm_meter.cli.stream_completion") as mock_stream, \
+         patch("llm_meter.cli.load_tokenizer") as mock_load:
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "run-one",
+                "--endpoint", "http://localhost:8000/v1",
+                "--model", "test-model",
+                "--tokenizer", "fake",
+                "--input-tokens", "0",
+                "--max-output-tokens", "64",
+                "--output", str(output_file),
+            ])
+        assert exc_info.value.code != 0
+        captured = capsys.readouterr()
+        assert "positive" in captured.err.lower() or "input-tokens" in captured.err.lower()
+        assert not mock_stream.called
+        assert not mock_load.called
+        assert not output_file.exists()
+
+
+def test_run_one_max_output_tokens_zero_rejected_before_request(
+    tmp_path: Path, capsys: object
+) -> None:
+    output_file = tmp_path / "should_not_exist.json"
+    with patch("llm_meter.cli.stream_completion") as mock_stream, \
+         patch("llm_meter.cli.load_tokenizer") as mock_load:
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "run-one",
+                "--endpoint", "http://localhost:8000/v1",
+                "--model", "test-model",
+                "--tokenizer", "fake",
+                "--input-tokens", "50",
+                "--max-output-tokens", "0",
+                "--output", str(output_file),
+            ])
+        assert exc_info.value.code != 0
+        captured = capsys.readouterr()
+        assert "positive" in captured.err.lower() or "max-output-tokens" in captured.err.lower()
+        assert not mock_stream.called
+        assert not mock_load.called
+        assert not output_file.exists()

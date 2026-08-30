@@ -11,6 +11,7 @@ from llm_meter.tokenizer import Tokenizer, TokenizerProvenance
 class ResolutionStatus(StrEnum):
     EXACT = "exact"
     NEAREST = "nearest"
+    NOT_APPLICABLE = "not_applicable"
     UNRESOLVABLE = "unresolvable"
 
 
@@ -21,8 +22,8 @@ class PromptSource(StrEnum):
 
 @dataclass
 class WorkloadSpec:
-    input_tokens_target: int
-    output_tokens_target: int
+    input_tokens_target: int | None
+    output_tokens_target: int | None
     seed: int = 0
     prompt_source: str = PromptSource.BUILTIN.value
     tokenizer_id: str | None = None
@@ -33,9 +34,9 @@ class RequestSpec:
     prompt: str
     prompt_sha256: str
     prompt_chars: int
-    input_tokens_target: int
-    input_tokens_actual: int | None
-    max_output_tokens: int
+    input_tokens_target: int | None
+    input_tokens_actual_local: int | None
+    max_output_tokens: int | None
     resolution_status: ResolutionStatus
     tokenizer_provenance: TokenizerProvenance | None
     workload_seed: int
@@ -120,18 +121,42 @@ def _deterministic_prompt(target_tokens: int, seed: int, tokenizer: Tokenizer) -
     return _truncate_to_tokens(current, target_tokens, tokenizer)
 
 
+def _validate_builtin(spec: WorkloadSpec) -> None:
+    if spec.input_tokens_target is None:
+        raise ValueError("builtin workload requires input_tokens_target")
+    if spec.input_tokens_target <= 0:
+        raise ValueError(
+            f"input_tokens_target must be positive for builtin prompts, "
+            f"got {spec.input_tokens_target}"
+        )
+    if spec.output_tokens_target is None:
+        raise ValueError("builtin workload requires output_tokens_target")
+    if spec.output_tokens_target <= 0:
+        raise ValueError(
+            f"output_tokens_target must be positive, got {spec.output_tokens_target}"
+        )
+
+
+def _validate_manual(spec: WorkloadSpec) -> None:
+    if spec.input_tokens_target is not None:
+        raise ValueError(
+            "manual workload input_tokens_target must be None; "
+            "manual prompts are not target-generated"
+        )
+    if spec.output_tokens_target is not None and spec.output_tokens_target <= 0:
+        raise ValueError(
+            f"output_tokens_target must be positive, got {spec.output_tokens_target}"
+        )
+
+
 def resolve_workload(
     spec: WorkloadSpec,
     tokenizer: Tokenizer | None,
     *,
     manual_prompt: str | None = None,
 ) -> RequestSpec:
-    if spec.output_tokens_target <= 0:
-        raise ValueError(
-            f"output_tokens_target must be positive, got {spec.output_tokens_target}"
-        )
-
     if spec.prompt_source == PromptSource.MANUAL.value:
+        _validate_manual(spec)
         if manual_prompt is None:
             raise ValueError("manual prompt_source requires a manual_prompt argument")
 
@@ -141,46 +166,27 @@ def resolve_workload(
 
         if tokenizer is not None:
             actual = _encode_count(tokenizer, prompt)
-            if spec.input_tokens_target > 0 and actual == spec.input_tokens_target:
-                status = ResolutionStatus.EXACT
-            else:
-                status = ResolutionStatus.NEAREST
             tok_prov = tokenizer.provenance()
         else:
             actual = None
-            status = ResolutionStatus.UNRESOLVABLE
             tok_prov = None
 
         return RequestSpec(
             prompt=prompt,
             prompt_sha256=prompt_sha256,
             prompt_chars=prompt_chars,
-            input_tokens_target=spec.input_tokens_target,
-            input_tokens_actual=actual,
+            input_tokens_target=None,
+            input_tokens_actual_local=actual,
             max_output_tokens=spec.output_tokens_target,
-            resolution_status=status,
+            resolution_status=ResolutionStatus.NOT_APPLICABLE,
             tokenizer_provenance=tok_prov,
             workload_seed=spec.seed,
         )
 
-    if spec.input_tokens_target <= 0:
-        raise ValueError(
-            f"input_tokens_target must be positive for builtin prompts, "
-            f"got {spec.input_tokens_target}"
-        )
+    _validate_builtin(spec)
 
     if tokenizer is None:
-        return RequestSpec(
-            prompt="",
-            prompt_sha256=fingerprint_prompt(""),
-            prompt_chars=0,
-            input_tokens_target=spec.input_tokens_target,
-            input_tokens_actual=None,
-            max_output_tokens=spec.output_tokens_target,
-            resolution_status=ResolutionStatus.UNRESOLVABLE,
-            tokenizer_provenance=None,
-            workload_seed=spec.seed,
-        )
+        raise ValueError("builtin workload requires a tokenizer")
 
     prompt = _deterministic_prompt(spec.input_tokens_target, spec.seed, tokenizer)
     prompt_sha256 = fingerprint_prompt(prompt)
@@ -197,7 +203,7 @@ def resolve_workload(
         prompt_sha256=prompt_sha256,
         prompt_chars=prompt_chars,
         input_tokens_target=spec.input_tokens_target,
-        input_tokens_actual=actual,
+        input_tokens_actual_local=actual,
         max_output_tokens=spec.output_tokens_target,
         resolution_status=status,
         tokenizer_provenance=tokenizer.provenance(),

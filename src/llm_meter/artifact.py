@@ -268,10 +268,10 @@ def _dict_to_run(obj: dict[str, Any]) -> BenchmarkRun:
         workload = WorkloadProvenance(
             source=w["source"],
             seed=w["seed"],
-            input_tokens_target=w["input_tokens_target"],
-            output_tokens_target=w["output_tokens_target"],
+            input_tokens_target=w.get("input_tokens_target"),
+            output_tokens_target=w.get("output_tokens_target"),
             input_tokens_actual_local=w.get("input_tokens_actual_local"),
-            resolution_status=w.get("resolution_status", "unresolvable"),
+            resolution_status=w.get("resolution_status", "not_applicable"),
             prompt_sha256=w.get("prompt_sha256", ""),
             prompt_chars=w.get("prompt_chars", 0),
             tokenizer_provider=w.get("tokenizer_provider"),

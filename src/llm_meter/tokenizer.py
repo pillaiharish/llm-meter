@@ -24,6 +24,12 @@ class Tokenizer(Protocol):
 
 
 class FakeTokenizer:
+    """Deterministic tokenizer for tests and development only.
+
+    FakeTokenizer exists for deterministic tests and development only.
+    It is not suitable for benchmark token-length claims.
+    """
+
     def __init__(
         self,
         tokenizer_id: str = "fake-tokenizer",

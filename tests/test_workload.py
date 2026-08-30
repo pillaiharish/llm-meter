@@ -19,8 +19,8 @@ def _make_tokenizer() -> FakeTokenizer:
 
 
 def _make_spec(
-    input_tokens: int = 100,
-    output_tokens: int = 64,
+    input_tokens: int | None = 100,
+    output_tokens: int | None = 64,
     seed: int = 42,
     prompt_source: str = PromptSource.BUILTIN.value,
     tokenizer_id: str | None = "fake-test",
@@ -55,60 +55,83 @@ def test_actual_token_count_measured_not_copied() -> None:
     tok = _make_tokenizer()
     spec = _make_spec(input_tokens=100, seed=42)
     req = resolve_workload(spec, tok)
-    assert req.input_tokens_actual == len(tok.encode(req.prompt, add_special_tokens=False))
-    assert req.input_tokens_actual is not None
+    assert req.input_tokens_actual_local == len(
+        tok.encode(req.prompt, add_special_tokens=False)
+    )
+    assert req.input_tokens_actual_local is not None
     assert req.input_tokens_target == 100
 
 
-def test_exact_target_reported_as_exact() -> None:
+def test_exact_resolution_deterministic() -> None:
     tok = _make_tokenizer()
-    spec = _make_spec(input_tokens=50, seed=42)
+    target = 50
+    spec = _make_spec(input_tokens=target, seed=42)
     req = resolve_workload(spec, tok)
-    if req.input_tokens_actual == spec.input_tokens_target:
-        assert req.resolution_status == ResolutionStatus.EXACT
-    else:
-        assert req.resolution_status == ResolutionStatus.NEAREST
+    assert req.input_tokens_actual_local == target
+    assert req.resolution_status == ResolutionStatus.EXACT
 
 
-def test_mismatch_explicitly_represented() -> None:
+def test_nearest_resolution_deterministic() -> None:
     tok = FakeTokenizer(tokenizer_id="fake-odd", tokens_per_char=1.3)
+    target = 50
     spec = WorkloadSpec(
-        input_tokens_target=50,
+        input_tokens_target=target,
         output_tokens_target=64,
         seed=42,
         tokenizer_id="fake-odd",
     )
     req = resolve_workload(spec, tok)
-    if req.input_tokens_actual != spec.input_tokens_target:
-        assert req.resolution_status == ResolutionStatus.NEAREST
+    assert req.input_tokens_actual_local != target
+    assert req.resolution_status == ResolutionStatus.NEAREST
 
 
 def test_no_infinite_adjustment_loop() -> None:
     tok = _make_tokenizer()
     spec = _make_spec(input_tokens=1_000_000, seed=42)
     req = resolve_workload(spec, tok)
-    assert req.input_tokens_actual is not None
-    assert req.input_tokens_actual < 1_000_000
+    assert req.input_tokens_actual_local is not None
+    assert req.input_tokens_actual_local < 1_000_000
     assert req.resolution_status in (ResolutionStatus.EXACT, ResolutionStatus.NEAREST)
 
 
-def test_zero_input_tokens_rejected_for_builtin() -> None:
+def test_builtin_zero_input_tokens_rejected() -> None:
     tok = _make_tokenizer()
     spec = _make_spec(input_tokens=0, seed=42)
     with pytest.raises(ValueError):
         resolve_workload(spec, tok)
 
 
-def test_negative_input_tokens_rejected_for_builtin() -> None:
+def test_builtin_negative_input_tokens_rejected() -> None:
     tok = _make_tokenizer()
     spec = _make_spec(input_tokens=-10, seed=42)
     with pytest.raises(ValueError):
         resolve_workload(spec, tok)
 
 
-def test_zero_output_tokens_rejected() -> None:
+def test_builtin_zero_output_tokens_rejected() -> None:
     tok = _make_tokenizer()
     spec = _make_spec(input_tokens=50, output_tokens=0, seed=42)
+    with pytest.raises(ValueError):
+        resolve_workload(spec, tok)
+
+
+def test_builtin_negative_output_tokens_rejected() -> None:
+    tok = _make_tokenizer()
+    spec = _make_spec(input_tokens=50, output_tokens=-5, seed=42)
+    with pytest.raises(ValueError):
+        resolve_workload(spec, tok)
+
+
+def test_builtin_none_input_tokens_rejected() -> None:
+    tok = _make_tokenizer()
+    spec = _make_spec(input_tokens=None, seed=42)
+    with pytest.raises(ValueError):
+        resolve_workload(spec, tok)
+
+
+def test_builtin_none_output_tokens_rejected() -> None:
+    tok = _make_tokenizer()
+    spec = _make_spec(input_tokens=50, output_tokens=None, seed=42)
     with pytest.raises(ValueError):
         resolve_workload(spec, tok)
 
@@ -118,22 +141,19 @@ def test_output_target_is_target_not_actual() -> None:
     spec = _make_spec(input_tokens=50, output_tokens=128, seed=42)
     req = resolve_workload(spec, tok)
     assert req.max_output_tokens == 128
-    assert req.input_tokens_actual != req.max_output_tokens
+    assert req.input_tokens_actual_local != req.max_output_tokens
 
 
-def test_no_tokenizer_returns_unresolvable() -> None:
+def test_generated_prompt_without_tokenizer_raises() -> None:
     spec = _make_spec(tokenizer_id=None)
-    req = resolve_workload(spec, None)
-    assert req.resolution_status == ResolutionStatus.UNRESOLVABLE
-    assert req.input_tokens_actual is None
-    assert req.prompt == ""
-    assert req.tokenizer_provenance is None
+    with pytest.raises(ValueError, match="builtin workload requires a tokenizer"):
+        resolve_workload(spec, None)
 
 
 def test_manual_prompt_deterministic_fingerprint() -> None:
     tok = _make_tokenizer()
     spec = _make_spec(
-        input_tokens=0,
+        input_tokens=None,
         prompt_source=PromptSource.MANUAL.value,
     )
     req1 = resolve_workload(spec, tok, manual_prompt="Hello world")
@@ -142,51 +162,64 @@ def test_manual_prompt_deterministic_fingerprint() -> None:
     assert req1.prompt_sha256 == hashlib.sha256(b"Hello world").hexdigest()
 
 
-def test_manual_prompt_token_count_measured() -> None:
+def test_manual_prompt_with_tokenizer_measures_and_not_applicable() -> None:
     tok = _make_tokenizer()
     spec = _make_spec(
-        input_tokens=0,
+        input_tokens=None,
         prompt_source=PromptSource.MANUAL.value,
+        tokenizer_id="fake-test",
     )
     req = resolve_workload(spec, tok, manual_prompt="Hello")
-    assert req.input_tokens_actual == len("Hello")
-    assert req.resolution_status == ResolutionStatus.NEAREST
+    assert req.input_tokens_target is None
+    assert req.input_tokens_actual_local is not None
+    assert req.input_tokens_actual_local == 5
+    assert req.resolution_status == ResolutionStatus.NOT_APPLICABLE
+    assert req.tokenizer_provenance is not None
+    assert req.tokenizer_provenance.provider == "fake"
 
 
-def test_manual_prompt_no_tokenizer_no_fabricated_count() -> None:
+def test_manual_prompt_without_tokenizer_not_applicable() -> None:
     spec = _make_spec(
-        input_tokens=0,
+        input_tokens=None,
         prompt_source=PromptSource.MANUAL.value,
         tokenizer_id=None,
     )
     req = resolve_workload(spec, None, manual_prompt="Hello")
-    assert req.input_tokens_actual is None
-    assert req.resolution_status == ResolutionStatus.UNRESOLVABLE
+    assert req.input_tokens_target is None
+    assert req.input_tokens_actual_local is None
+    assert req.resolution_status == ResolutionStatus.NOT_APPLICABLE
     assert req.prompt_sha256 == hashlib.sha256(b"Hello").hexdigest()
     assert req.prompt_chars == 5
     assert req.tokenizer_provenance is None
 
 
-def test_manual_prompt_with_tokenizer_records_local_count() -> None:
+def test_manual_prompt_without_output_target_does_not_fabricate() -> None:
     tok = _make_tokenizer()
-    spec = _make_spec(
-        input_tokens=0,
+    spec = WorkloadSpec(
+        input_tokens_target=None,
+        output_tokens_target=None,
+        seed=0,
         prompt_source=PromptSource.MANUAL.value,
         tokenizer_id="fake-test",
     )
     req = resolve_workload(spec, tok, manual_prompt="Hello")
-    assert req.input_tokens_actual is not None
-    assert req.input_tokens_actual == 5
-    assert req.tokenizer_provenance is not None
-    assert req.tokenizer_provenance.provider == "fake"
+    assert req.max_output_tokens is None
+    assert req.input_tokens_target is None
+    assert req.input_tokens_actual_local is not None
+    assert req.resolution_status == ResolutionStatus.NOT_APPLICABLE
 
 
-def test_generated_prompt_requires_tokenizer() -> None:
-    spec = _make_spec(tokenizer_id=None)
-    req = resolve_workload(spec, None)
-    assert req.resolution_status == ResolutionStatus.UNRESOLVABLE
-    assert req.prompt == ""
-    assert req.input_tokens_actual is None
+def test_manual_prompt_with_explicit_input_target_rejected() -> None:
+    tok = _make_tokenizer()
+    spec = WorkloadSpec(
+        input_tokens_target=50,
+        output_tokens_target=None,
+        seed=0,
+        prompt_source=PromptSource.MANUAL.value,
+        tokenizer_id="fake-test",
+    )
+    with pytest.raises(ValueError, match="input_tokens_target must be None"):
+        resolve_workload(spec, tok, manual_prompt="Hello")
 
 
 def test_different_seed_deterministic() -> None:
@@ -228,10 +261,11 @@ def test_tokenizer_revision_none_stays_none() -> None:
 
 def test_final_reencode_determines_exact_or_nearest() -> None:
     tok = _make_tokenizer()
-    spec = _make_spec(input_tokens=50, seed=42)
+    target = 50
+    spec = _make_spec(input_tokens=target, seed=42)
     req = resolve_workload(spec, tok)
     final_count = len(tok.encode(req.prompt, add_special_tokens=False))
-    if final_count == spec.input_tokens_target:
+    if final_count == target:
         assert req.resolution_status == ResolutionStatus.EXACT
     else:
         assert req.resolution_status == ResolutionStatus.NEAREST

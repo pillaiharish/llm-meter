@@ -342,7 +342,7 @@ llm-meter run-one \
 llm-meter run-one \
   --endpoint http://localhost:8000/v1 \
   --model some-model \
-  --tokenizer fake \
+  --tokenizer Qwen/Qwen3-8B \
   --input-tokens 512 \
   --max-output-tokens 128 \
   --seed 42 \
@@ -355,6 +355,16 @@ artifact to the specified path, and prints a concise summary.
 `--prompt` and `--input-tokens` are mutually exclusive. `--input-tokens`
 requires `--tokenizer`. Manual `--prompt` may optionally specify `--tokenizer`
 so that llm-meter can locally measure the prompt token count.
+
+A manually supplied prompt has no input token target unless future APIs
+explicitly introduce one. If a tokenizer is supplied, llm-meter records the
+locally measured token count. That measured count is not a target-resolution
+result. Manual mode may omit `--max-output-tokens`; in that case the HTTP
+request simply omits `max_tokens`.
+
+Hugging Face tokenizer loading (`--tokenizer Qwen/Qwen3-8B`) may require
+network access or a populated local tokenizer cache. CI for llm-meter itself
+remains network-free; tests use a deterministic `FakeTokenizer`.
 
 ### Workload specification
 
@@ -374,9 +384,10 @@ Resolution status:
 
 | Status | Meaning |
 | --- | --- |
-| `exact` | Local token count exactly equals the target |
-| `nearest` | A valid prompt was produced but the local count differs from the target |
-| `unresolvable` | No valid prompt could be produced (e.g. no tokenizer) |
+| `exact` | Local token count exactly equals the target (builtin only) |
+| `nearest` | A valid prompt was produced but the local count differs from the target (builtin only) |
+| `not_applicable` | Manual prompt — no input token target to resolve against |
+| `unresolvable` | No valid prompt could be produced (reserved for future bounded construction failures) |
 
 ### `workload inspect`
 
@@ -384,13 +395,15 @@ Inspect a resolved workload specification without making any network request:
 
 ```bash
 llm-meter workload inspect \
-  --tokenizer fake \
+  --tokenizer Qwen/Qwen3-8B \
   --input-tokens 512 \
   --output-tokens 128 \
   --seed 42
 ```
 
-Add `--show-prompt` to print the full generated prompt text.
+`--tokenizer` is required. Add `--show-prompt` to print the full generated
+prompt text. Hugging Face tokenizer loading may require network access or a
+populated local tokenizer cache.
 
 ### BenchmarkRun artifact
 
@@ -458,8 +471,8 @@ The artifact is a JSON object with schema version `1`. It contains:
     "resolution_status": "nearest",
     "prompt_sha256": "ab12cd34...",
     "prompt_chars": 2104,
-    "tokenizer_provider": "fake",
-    "tokenizer_id": "fake",
+    "tokenizer_provider": "huggingface",
+    "tokenizer_id": "Qwen/Qwen3-8B",
     "tokenizer_revision": null
   }
 }
