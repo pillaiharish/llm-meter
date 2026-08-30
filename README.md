@@ -305,6 +305,174 @@ The first engine-specific integration can target vLLM benchmarking while retaini
 
 ---
 
+## Current capability (experimental)
+
+`llm-meter` can now perform a **single streaming request** against an
+OpenAI-compatible endpoint, preserve raw observations, and serialize a
+versioned `BenchmarkRun` JSON artifact.
+
+This is an experimental single-request capability. It is not the full V1
+benchmark. Concurrency, sweeps, warmup, percentiles, and aggregate throughput
+are not yet implemented.
+
+### Usage
+
+```bash
+export LLM_METER_API_KEY="your-api-key"   # optional, if the endpoint requires auth
+
+llm-meter run-one \
+  --endpoint http://localhost:8000/v1 \
+  --model some-model \
+  --prompt "Explain dynamic batching briefly." \
+  --max-output-tokens 64 \
+  --output run.json
+```
+
+The command performs exactly one streaming request, saves a `BenchmarkRun`
+artifact to the specified path, and prints a concise summary.
+
+### BenchmarkRun artifact
+
+The artifact is a JSON object with schema version `1`. It contains:
+
+```json
+{
+  "schema_version": "1",
+  "run_id": "uuid",
+  "started_at": "2025-01-01T00:00:00+00:00",
+  "configuration": {
+    "endpoint": "http://localhost:8000/v1",
+    "model": "some-model",
+    "streaming": true,
+    "max_output_tokens": 64
+  },
+  "request_start": {
+    "offset_ns": 0,
+    "wall_clock_utc": "2025-01-01T00:00:00+00:00"
+  },
+  "stream_events": [
+    {
+      "sequence": 0,
+      "offset_ns": 12000000,
+      "event_type": "metadata",
+      "text_delta": null,
+      "finish_reason": null,
+      "usage": null
+    },
+    {
+      "sequence": 1,
+      "offset_ns": 45000000,
+      "event_type": "content",
+      "text_delta": "Hello",
+      "finish_reason": null,
+      "usage": null
+    }
+  ],
+  "completion": {
+    "offset_ns": 90000000,
+    "wall_clock_utc": "2025-01-01T00:00:01+00:00"
+  },
+  "error": null,
+  "usage": {
+    "input_tokens": 5,
+    "output_tokens": 10,
+    "source": "server_reported"
+  },
+  "metrics": {
+    "client_ttft_ns": 45000000,
+    "e2e_latency_ns": 90000000,
+    "inter_chunk_latencies_ns": [33000000, 15000000],
+    "tpot_ns": 5000000,
+    "tpot_status": "ok"
+  },
+  "provenance": {
+    "llm_meter_version": "0.1.0.dev0"
+  }
+}
+```
+
+All timestamps are **integer nanoseconds** relative to an explicit run origin.
+Absent data is represented as `null` rather than fabricated. No API keys or
+secrets appear in the artifact.
+
+---
+
+## Measurement semantics
+
+These definitions are part of the public contract.
+
+### Monotonic vs wall clock
+
+- **Monotonic clock** (`time.perf_counter_ns()`): used for all elapsed-time
+  and latency measurements. Stored as integer nanoseconds (`offset_ns`,
+  `duration_ns`) relative to an explicit request/run origin. Monotonic clocks
+  are not affected by system time adjustments.
+- **Wall clock** (UTC ISO 8601): stored for human correlation and provenance
+  only. Never used for latency calculation. Wall-clock timestamps may drift or
+  jump; monotonic timestamps do not.
+
+### client-observed TTFT
+
+Time from the measured client request start until the first **content-bearing**
+streamed generation event. Metadata-only events (e.g. role assignment) are not
+counted. If no content-bearing event arrives, `client_ttft_ns` is `null`.
+
+This is a **client-observed** metric. It is not the same as server-side prefill
+latency, which requires engine/runtime instrumentation.
+
+### inter-chunk latency
+
+Time between successive streamed chunk arrivals. A streamed SSE chunk may
+contain zero, one, or multiple token pieces depending on engine, protocol, and
+detokenization behavior. Therefore `inter_chunk_latency` is **not** the same as
+token-level ITL (Inter-Token Latency).
+
+True ITL can only be derived when an adapter provides a defensible
+token-to-timestamp mapping. `llm-meter` preserves raw stream-event timestamps
+so that later adapters can derive true ITL without losing raw observations.
+
+### E2E latency
+
+```
+E2E = completion_offset_ns - request_start_offset_ns
+```
+
+Measured entirely from the monotonic clock. If the request did not complete
+(error or unexpected end), `e2e_latency_ns` is `null`.
+
+### TPOT
+
+For a completed generation with more than one output token:
+
+```
+TPOT = (E2E - client_ttft) / (output_tokens - 1)
+```
+
+Constraints:
+
+- The **exact token-count source** must be recorded in the artifact.
+- `output_tokens <= 1` → TPOT is `null` with status `insufficient_tokens`.
+- No token count available → TPOT is `null` with status `no_token_count`.
+- Chunk count is **never** substituted for token count.
+- Raw timestamps and counts remain the source of truth; TPOT is a derived
+  aggregate.
+
+### token-count source
+
+The artifact records how token counts were obtained:
+
+| Source | Description |
+| --- | --- |
+| `server_reported` | From the OpenAI-compatible `usage` field in the response |
+| `engine_reported` | From an engine-specific metrics endpoint (planned) |
+| `locally_tokenized` | From a client-side tokenizer approximation (planned) |
+| `unknown` | No token count available |
+
+Never silently mix sources. A measurement from one source is not directly
+comparable to a measurement from another without explicit context.
+
+---
+
 ## Non-goals
 
 For early versions, `llm-meter` is **not**:
@@ -403,6 +571,9 @@ Apache License 2.0. See [LICENSE](LICENSE).
 
 ## Status
 
-`llm-meter` is under active development. V1 is being designed. No production benchmark capability is claimed yet.
+`llm-meter` is under active development. The experimental `run-one` command can
+perform a single streaming request and produce a `BenchmarkRun` JSON artifact.
+Concurrency, workload sweeps, GPU telemetry, percentiles, and aggregate
+throughput are not yet implemented. V1 is being designed.
 
 `llm-meter` measures LLM inference performance in a way that can eventually answer not only *"how fast was it?"* but also *"under exactly what conditions, and why?"*
