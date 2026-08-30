@@ -1,0 +1,171 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from llm_meter import __version__
+from llm_meter.artifact import SCHEMA_VERSION, build_run, from_json, to_json, write_artifact
+from llm_meter.models import (
+    Completion,
+    ErrorObservation,
+    RawObservations,
+    RequestStart,
+    RunConfiguration,
+    StreamEvent,
+    TokenCountSource,
+    Usage,
+)
+
+
+def _make_run():
+    configuration = RunConfiguration(
+        endpoint="http://localhost:8000/v1",
+        model="test-model",
+        streaming=True,
+        max_output_tokens=64,
+    )
+    observations = RawObservations(
+        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
+        stream_events=[
+            StreamEvent(sequence=0, offset_ns=10_000_000, event_type="metadata"),
+            StreamEvent(
+                sequence=1,
+                offset_ns=50_000_000,
+                event_type="content",
+                text_delta="Hello",
+            ),
+            StreamEvent(
+                sequence=2,
+                offset_ns=80_000_000,
+                event_type="content",
+                text_delta=" world",
+            ),
+            StreamEvent(
+                sequence=3,
+                offset_ns=90_000_000,
+                event_type="metadata",
+                finish_reason="stop",
+                usage={"prompt_tokens": 5, "completion_tokens": 2},
+            ),
+        ],
+        completion=Completion(offset_ns=100_000_000, wall_clock_utc="2025-01-01T00:00:01Z"),
+        usage=Usage(input_tokens=5, output_tokens=2, source=TokenCountSource.SERVER_REPORTED),
+    )
+    return build_run(
+        run_id="test-run-id",
+        started_at="2025-01-01T00:00:00Z",
+        configuration=configuration,
+        observations=observations,
+    )
+
+
+def test_schema_version_present() -> None:
+    run = _make_run()
+    assert run.schema_version == SCHEMA_VERSION
+    data = json.loads(to_json(run))
+    assert data["schema_version"] == SCHEMA_VERSION
+
+
+def test_json_round_trip() -> None:
+    run = _make_run()
+    json_str = to_json(run)
+    restored = from_json(json_str)
+
+    assert restored.schema_version == run.schema_version
+    assert restored.run_id == run.run_id
+    assert restored.started_at == run.started_at
+    assert restored.configuration.endpoint == run.configuration.endpoint
+    assert restored.configuration.model == run.configuration.model
+    assert restored.configuration.streaming == run.configuration.streaming
+    assert restored.request_start.offset_ns == run.request_start.offset_ns
+    assert len(restored.stream_events) == len(run.stream_events)
+    assert restored.completion.offset_ns == run.completion.offset_ns
+    assert restored.usage.input_tokens == run.usage.input_tokens
+    assert restored.usage.output_tokens == run.usage.output_tokens
+    assert restored.usage.source == run.usage.source
+    assert restored.metrics.client_ttft_ns == run.metrics.client_ttft_ns
+    assert restored.metrics.e2e_latency_ns == run.metrics.e2e_latency_ns
+    assert restored.metrics.inter_chunk_latencies_ns == run.metrics.inter_chunk_latencies_ns
+    assert restored.metrics.tpot_ns == run.metrics.tpot_ns
+    assert restored.metrics.tpot_status == run.metrics.tpot_status
+    assert restored.provenance.llm_meter_version == run.provenance.llm_meter_version
+
+
+def test_no_secrets_in_serialized_output() -> None:
+    run = _make_run()
+    json_str = to_json(run)
+    assert "api_key" not in json_str
+    assert "authorization" not in json_str
+    assert "bearer" not in json_str.lower()
+    assert "secret" not in json_str.lower()
+
+
+def test_ns_fields_are_integers() -> None:
+    run = _make_run()
+    data = json.loads(to_json(run))
+
+    assert isinstance(data["request_start"]["offset_ns"], int)
+    assert isinstance(data["completion"]["offset_ns"], int)
+    for event in data["stream_events"]:
+        assert isinstance(event["offset_ns"], int)
+    assert isinstance(data["metrics"]["client_ttft_ns"], int)
+    assert isinstance(data["metrics"]["e2e_latency_ns"], int)
+    for lag in data["metrics"]["inter_chunk_latencies_ns"]:
+        assert isinstance(lag, int)
+
+
+def test_absent_data_is_null_not_fabricated() -> None:
+    configuration = RunConfiguration(
+        endpoint="http://localhost:8000/v1",
+        model="test-model",
+        streaming=True,
+        max_output_tokens=None,
+    )
+    observations = RawObservations(
+        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
+        stream_events=[],
+        completion=None,
+        error=ErrorObservation(
+            offset_ns=100_000_000,
+            category="http_error",
+            status=500,
+            message="server error",
+        ),
+        usage=Usage(source=TokenCountSource.UNKNOWN),
+    )
+    run = build_run(
+        run_id="error-run-id",
+        started_at="2025-01-01T00:00:00Z",
+        configuration=configuration,
+        observations=observations,
+    )
+
+    data = json.loads(to_json(run))
+
+    assert data["completion"] is None
+    assert data["error"] is not None
+    assert data["error"]["category"] == "http_error"
+    assert data["error"]["status"] == 500
+    assert data["usage"]["input_tokens"] is None
+    assert data["usage"]["output_tokens"] is None
+    assert data["usage"]["source"] == "unknown"
+    assert data["metrics"]["client_ttft_ns"] is None
+    assert data["metrics"]["e2e_latency_ns"] is None
+    assert data["metrics"]["tpot_ns"] is None
+
+
+def test_write_artifact_to_file(tmp_path: Path) -> None:
+    run = _make_run()
+    output_path = tmp_path / "runs" / "test-run.json"
+    result = write_artifact(run, output_path)
+
+    assert result == output_path
+    assert output_path.exists()
+    content = output_path.read_text(encoding="utf-8")
+    assert json.loads(content)["run_id"] == "test-run-id"
+
+
+def test_provenance_has_version() -> None:
+    run = _make_run()
+    data = json.loads(to_json(run))
+    assert data["provenance"]["llm_meter_version"] == __version__
