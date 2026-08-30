@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llm-meter"
+version = "0.1.0.dev0"
+description = "Transparent, reproducible metrology for LLM inference performance."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+keywords = [
+    "llm",
+    "inference",
+    "benchmarking",
+    "gpu",
+    "performance",
+    "observability",
+    "vllm",
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Benchmark",
+]
+
+[project.scripts]
+llm-meter = "llm_meter.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/pillaiharish/llm-meter"
+Repository = "https://github.com/pillaiharish/llm-meter"
+Issues = "https://github.com/pillaiharish/llm-meter/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llm_meter"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
