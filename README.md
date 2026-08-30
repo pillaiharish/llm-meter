@@ -307,9 +307,19 @@ The first engine-specific integration can target vLLM benchmarking while retaini
 
 ## Current capability (experimental)
 
-`llm-meter` can now perform a **single streaming request** against an
-OpenAI-compatible endpoint, preserve raw observations, and serialize a
-versioned `BenchmarkRun` JSON artifact.
+`llm-meter` can now:
+
+- **perform a single streaming request** against an OpenAI-compatible endpoint,
+  preserve raw observations, and serialize a versioned `BenchmarkRun` JSON
+  artifact.
+- **construct deterministic, tokenizer-aware workloads** — given a tokenizer and
+  a target input-token count, generate a reproducible prompt from a built-in
+  corpus.
+- **record workload provenance** — the artifact records how the prompt was
+  constructed, what tokenizer was used, the target vs. actual local token count,
+  and a SHA-256 fingerprint of the prompt actually sent.
+- **fingerprint prompts** — the exact prompt text actually sent is hashed
+  (SHA-256) after final workload resolution, not before.
 
 This is an experimental single-request capability. It is not the full V1
 benchmark. Concurrency, sweeps, warmup, percentiles, and aggregate throughput
@@ -320,16 +330,80 @@ are not yet implemented.
 ```bash
 export LLM_METER_API_KEY="your-api-key"   # optional, if the endpoint requires auth
 
+# Mode A: manual prompt (optionally with a tokenizer for local token counting)
 llm-meter run-one \
   --endpoint http://localhost:8000/v1 \
   --model some-model \
   --prompt "Explain dynamic batching briefly." \
   --max-output-tokens 64 \
   --output run.json
+
+# Mode B: tokenizer-aware workload construction (reproducible prompt)
+llm-meter run-one \
+  --endpoint http://localhost:8000/v1 \
+  --model some-model \
+  --tokenizer Qwen/Qwen3-8B \
+  --input-tokens 512 \
+  --max-output-tokens 128 \
+  --seed 42 \
+  --output run.json
 ```
 
 The command performs exactly one streaming request, saves a `BenchmarkRun`
 artifact to the specified path, and prints a concise summary.
+
+`--prompt` and `--input-tokens` are mutually exclusive. `--input-tokens`
+requires `--tokenizer`. Manual `--prompt` may optionally specify `--tokenizer`
+so that llm-meter can locally measure the prompt token count.
+
+A manually supplied prompt has no input token target unless future APIs
+explicitly introduce one. If a tokenizer is supplied, llm-meter records the
+locally measured token count. That measured count is not a target-resolution
+result. Manual mode may omit `--max-output-tokens`; in that case the HTTP
+request simply omits `max_tokens`.
+
+Hugging Face tokenizer loading (`--tokenizer Qwen/Qwen3-8B`) may require
+network access or a populated local tokenizer cache. CI for llm-meter itself
+remains network-free; tests use a deterministic `FakeTokenizer`.
+
+### Workload specification
+
+`llm-meter` supports two prompt input modes:
+
+| Mode | Flags | Behavior |
+| --- | --- | --- |
+| Manual | `--prompt TEXT` (+ optional `--tokenizer`) | Use the supplied prompt text directly. If a tokenizer is provided, the local token count is measured and recorded. |
+| Builtin | `--input-tokens N --tokenizer TOKENIZER` | Construct a deterministic, reproducible prompt from a built-in corpus, sized to approximately N tokens. |
+
+For builtin workloads, the prompt is constructed deterministically from a
+seeded shuffle of a neutral sentence corpus, then truncated to the target
+token count. The final prompt is **re-encoded** after construction — the
+actual local token count is authoritative, not the target.
+
+Resolution status:
+
+| Status | Meaning |
+| --- | --- |
+| `exact` | Local token count exactly equals the target (builtin only) |
+| `nearest` | A valid prompt was produced but the local count differs from the target (builtin only) |
+| `not_applicable` | Manual prompt — no input token target to resolve against |
+| `unresolvable` | No valid prompt could be produced (reserved for future bounded construction failures) |
+
+### `workload inspect`
+
+Inspect a resolved workload specification without making any network request:
+
+```bash
+llm-meter workload inspect \
+  --tokenizer Qwen/Qwen3-8B \
+  --input-tokens 512 \
+  --output-tokens 128 \
+  --seed 42
+```
+
+`--tokenizer` is required. Add `--show-prompt` to print the full generated
+prompt text. Hugging Face tokenizer loading may require network access or a
+populated local tokenizer cache.
 
 ### BenchmarkRun artifact
 
@@ -387,13 +461,27 @@ The artifact is a JSON object with schema version `1`. It contains:
   },
   "provenance": {
     "llm_meter_version": "0.1.0.dev0"
+  },
+  "workload": {
+    "source": "builtin",
+    "seed": 42,
+    "input_tokens_target": 512,
+    "output_tokens_target": 128,
+    "input_tokens_actual_local": 510,
+    "resolution_status": "nearest",
+    "prompt_sha256": "ab12cd34...",
+    "prompt_chars": 2104,
+    "tokenizer_provider": "huggingface",
+    "tokenizer_id": "Qwen/Qwen3-8B",
+    "tokenizer_revision": null
   }
 }
 ```
 
 All timestamps are **integer nanoseconds** relative to an explicit run origin.
 Absent data is represented as `null` rather than fabricated. No API keys or
-secrets appear in the artifact.
+secrets appear in the artifact. Prompt text is **not** persisted in the
+artifact — only its SHA-256 fingerprint and character count.
 
 ---
 
@@ -470,6 +558,27 @@ The artifact records how token counts were obtained:
 
 Never silently mix sources. A measurement from one source is not directly
 comparable to a measurement from another without explicit context.
+
+### local prompt tokens vs. server prompt tokens
+
+`llm-meter` measures a **local prompt token count**
+(`workload.input_tokens_actual_local`) using the configured tokenizer with
+`add_special_tokens=False`. This counts the tokens of the **user prompt text
+payload** — the raw string sent in the `messages` array.
+
+This is **not** the same as `usage.input_tokens` (server-reported
+`prompt_tokens`). The server may apply additional transformations before
+prefill:
+
+- **chat templates** that wrap the user message with role markers
+- **BOS / EOS** or other special tokens
+- **system prompts** prepended by the serving engine
+- **tokenization differences** between the local tokenizer and the server's
+  tokenizer
+
+Therefore `workload.input_tokens_actual_local` and `usage.input_tokens` are
+**independent measurements** that may legitimately differ. Both are preserved
+in the artifact. Neither overwrites the other.
 
 ---
 
@@ -572,8 +681,21 @@ Apache License 2.0. See [LICENSE](LICENSE).
 ## Status
 
 `llm-meter` is under active development. The experimental `run-one` command can
-perform a single streaming request and produce a `BenchmarkRun` JSON artifact.
-Concurrency, workload sweeps, GPU telemetry, percentiles, and aggregate
-throughput are not yet implemented. V1 is being designed.
+perform a single streaming request and produce a `BenchmarkRun` JSON artifact
+with deterministic, tokenizer-aware workload specification and prompt
+fingerprinting. The `workload inspect` command resolves a workload
+specification without making any network request.
+
+Still planned:
+
+- concurrency
+- warmup / measured phases
+- percentiles (p50, p90, p95, p99)
+- aggregate throughput
+- GPU telemetry
+- engine-specific adapters
+- CSV export
+
+V1 is being designed.
 
 `llm-meter` measures LLM inference performance in a way that can eventually answer not only *"how fast was it?"* but also *"under exactly what conditions, and why?"*
