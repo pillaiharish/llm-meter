@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 from llm_meter import __version__
 from llm_meter.metrics import derive_metrics
@@ -54,7 +55,21 @@ def sanitize_endpoint(url: str) -> str:
             (k, "***REDACTED***" if k.lower() in _SENSITIVE_QUERY_PARAMS else v)
             for k, v in params
         ]
-        query = "&".join(f"{k}={v}" for k, v in redacted_params)
+        def _quote(
+            s: str,
+            safe: str = "",
+            encoding: str | None = None,
+            errors: str | None = None,
+        ) -> str:
+            if s == "***REDACTED***":
+                return s
+            return quote(s, safe, encoding, errors)
+
+        query = urlencode(
+            redacted_params,
+            doseq=True,
+            quote_via=_quote,
+        )
     else:
         query = ""
 
@@ -66,6 +81,16 @@ def sanitize_endpoint(url: str) -> str:
         query,
         parsed.fragment,
     ))
+
+
+_URL_PATTERN = re.compile(r"https?://\S+")
+
+
+def sanitize_text(text: str) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        return sanitize_endpoint(match.group(0))
+
+    return _URL_PATTERN.sub(_replace, text)
 
 
 def build_run(
@@ -90,6 +115,16 @@ def build_run(
         max_output_tokens=configuration.max_output_tokens,
     )
 
+    sanitized_error = None
+    if observations.error is not None:
+        sanitized_error = ErrorObservation(
+            offset_ns=observations.error.offset_ns,
+            category=observations.error.category,
+            status=observations.error.status,
+            exception_type=observations.error.exception_type,
+            message=sanitize_text(observations.error.message),
+        )
+
     return BenchmarkRun(
         schema_version=SCHEMA_VERSION,
         run_id=run_id,
@@ -101,7 +136,7 @@ def build_run(
         response_established=observations.response_established,
         stream_events=observations.stream_events,
         completion=observations.completion,
-        error=observations.error,
+        error=sanitized_error,
         usage=observations.usage,
         metrics=metrics,
     )

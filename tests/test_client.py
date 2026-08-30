@@ -445,10 +445,39 @@ def test_empty_content_does_not_trigger_ttft() -> None:
     assert content_events[0].offset_ns == 65_000_000
     metadata_events = [e for e in result.stream_events if e.event_type == "metadata"]
     assert len(metadata_events) == 3
-    empty_content_deltas = [
-        e for e in result.stream_events if e.text_delta is None and e.event_type == "metadata"
-    ]
-    assert len(empty_content_deltas) >= 1
+
+
+def test_preserve_empty_content_delta() -> None:
+    transport = _make_sse_response([
+        _role_delta(),
+        _content_delta(""),
+        _content_delta("Hello"),
+        _finish("stop"),
+        "[DONE]",
+    ])
+    clock = FakeClock([5_000_000, 10_000_000, 10_000_000, 40_000_000, 10_000_000, 10_000_000])
+
+    result = asyncio_run(
+        stream_completion(
+            endpoint="http://localhost:8000/v1",
+            model="test-model",
+            prompt="hi",
+            clock=clock,
+            transport=transport,
+        )
+    )
+
+    role_event = result.stream_events[0]
+    assert role_event.event_type == "metadata"
+    assert role_event.text_delta is None
+
+    empty_event = result.stream_events[1]
+    assert empty_event.event_type == "metadata"
+    assert empty_event.text_delta == ""
+
+    content_event = result.stream_events[2]
+    assert content_event.event_type == "content"
+    assert content_event.text_delta == "Hello"
 
 
 def test_response_established_captured() -> None:

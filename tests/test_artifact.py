@@ -276,7 +276,7 @@ def test_endpoint_credentials_redacted() -> None:
     assert "***REDACTED***" in json_str
 
 
-def test_api_key_not_in_error_output() -> None:
+def test_error_message_url_redacted() -> None:
     configuration = RunConfiguration(
         endpoint="http://localhost:8000/v1",
         model="test-model",
@@ -287,22 +287,31 @@ def test_api_key_not_in_error_output() -> None:
         stream_events=[],
         error=ErrorObservation(
             offset_ns=10_000_000,
-            category="http_error",
-            status=401,
-            message="Unauthorized",
+            category="transport",
+            status=None,
+            exception_type="ConnectError",
+            message=(
+                "Connection failed: "
+                "https://user:password@example.test/v1?api_key=super-secret&region=us"
+            ),
         ),
         usage=Usage(source=TokenCountSource.UNKNOWN),
     )
     run = build_run(
-        run_id="error-test",
+        run_id="error-redact-test",
         started_at="2025-01-01T00:00:00Z",
         configuration=configuration,
         observations=observations,
     )
 
     json_str = to_json(run)
-    assert "secret-key-12345" not in json_str
-    assert "Bearer" not in json_str
+    assert "user:password" not in json_str
+    assert "super-secret" not in json_str
+    assert "password" not in json_str
+    assert "example.test" in json_str
+    assert "region=us" in json_str
+    assert "***REDACTED***" in json_str
+    assert "Connection failed" in json_str
 
 
 def test_run_status_in_artifact() -> None:
@@ -328,3 +337,15 @@ def test_sanitize_endpoint_redacts_query_params() -> None:
 def test_sanitize_endpoint_preserves_clean_url() -> None:
     result = sanitize_endpoint("http://localhost:8000/v1")
     assert result == "http://localhost:8000/v1"
+
+
+def test_sanitize_endpoint_preserves_encoded_values() -> None:
+    result = sanitize_endpoint("https://host.example/v1?label=a%20b%26c&api_key=secret")
+    from urllib.parse import parse_qs, urlparse
+
+    parsed = urlparse(result)
+    params = parse_qs(parsed.query)
+    assert params["label"] == ["a b&c"]
+    assert params["api_key"] == ["***REDACTED***"]
+    assert "secret" not in result
+    assert "host.example" in result

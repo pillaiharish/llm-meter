@@ -69,7 +69,11 @@ def _classify_event(
         choice = choices[0]
         delta = choice.get("delta", {})
         content = delta.get("content")
-        if content:
+        if content is None:
+            pass
+        elif content == "":
+            text_delta = ""
+        else:
             event_type = "content"
             text_delta = content
         fr = choice.get("finish_reason")
