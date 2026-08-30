@@ -93,6 +93,21 @@ class Provenance:
 
 
 @dataclass
+class WorkloadProvenance:
+    source: str
+    seed: int
+    input_tokens_target: int
+    output_tokens_target: int
+    input_tokens_actual_local: int | None = None
+    resolution_status: str = "unresolvable"
+    prompt_sha256: str = ""
+    prompt_chars: int = 0
+    tokenizer_provider: str | None = None
+    tokenizer_id: str | None = None
+    tokenizer_revision: str | None = None
+
+
+@dataclass
 class BenchmarkRun:
     schema_version: str
     run_id: str
@@ -100,6 +115,7 @@ class BenchmarkRun:
     run_status: str
     configuration: RunConfiguration
     provenance: Provenance
+    workload: WorkloadProvenance | None = None
     request_start: RequestStart | None = None
     response_established: ResponseEstablished | None = None
     stream_events: list[StreamEvent] = field(default_factory=list)

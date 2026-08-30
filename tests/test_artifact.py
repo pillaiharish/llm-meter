@@ -26,6 +26,7 @@ from llm_meter.models import (
     StreamEvent,
     TokenCountSource,
     Usage,
+    WorkloadProvenance,
 )
 
 
@@ -382,3 +383,245 @@ def test_sanitize_endpoint_preserves_encoded_values() -> None:
     assert params["api_key"] == ["***REDACTED***"]
     assert "secret" not in result
     assert "host.example" in result
+
+
+_PR2_ARTIFACT_JSON = json.dumps({
+    "schema_version": "1",
+    "run_id": "pr2-legacy-run",
+    "started_at": "2025-01-01T00:00:00Z",
+    "run_status": "completed",
+    "configuration": {
+        "endpoint": "http://localhost:8000/v1",
+        "model": "test-model",
+        "streaming": True,
+        "max_output_tokens": 64,
+    },
+    "provenance": {"llm_meter_version": "0.1.0.dev0"},
+    "request_start": {
+        "offset_ns": 0,
+        "wall_clock_utc": "2025-01-01T00:00:00Z",
+    },
+    "response_established": {
+        "offset_ns": 5_000_000,
+        "status_code": 200,
+        "content_type": "text/event-stream",
+    },
+    "stream_events": [
+        {
+            "sequence": 0,
+            "offset_ns": 10_000_000,
+            "event_type": "content",
+            "text_delta": "Hi",
+            "finish_reason": None,
+            "usage": None,
+        },
+        {
+            "sequence": 1,
+            "offset_ns": 20_000_000,
+            "event_type": "metadata",
+            "text_delta": None,
+            "finish_reason": "stop",
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+        },
+    ],
+    "completion": {"offset_ns": 30_000_000, "wall_clock_utc": "2025-01-01T00:00:01Z"},
+    "error": None,
+    "usage": {"input_tokens": 2, "output_tokens": 1, "source": "server_reported"},
+    "metrics": {
+        "client_ttft_ns": 10_000_000,
+        "e2e_latency_ns": 30_000_000,
+        "inter_chunk_latencies_ns": [10_000_000],
+        "tpot_ns": None,
+        "tpot_status": "insufficient_tokens",
+    },
+})
+
+
+def test_pr2_artifact_backward_compat_workload_none() -> None:
+    restored = from_json(_PR2_ARTIFACT_JSON)
+    assert restored.workload is None
+    assert restored.run_id == "pr2-legacy-run"
+    assert restored.schema_version == "1"
+    assert restored.usage.input_tokens == 2
+
+
+def test_pr2_artifact_no_workload_key() -> None:
+    obj = json.loads(_PR2_ARTIFACT_JSON)
+    assert "workload" not in obj
+    restored = from_json(_PR2_ARTIFACT_JSON)
+    assert restored.workload is None
+
+
+def _make_workload_provenance() -> WorkloadProvenance:
+    return WorkloadProvenance(
+        source="builtin",
+        seed=42,
+        input_tokens_target=100,
+        output_tokens_target=64,
+        input_tokens_actual_local=98,
+        resolution_status="nearest",
+        prompt_sha256="abc123def456" + "0" * 52,
+        prompt_chars=420,
+        tokenizer_provider="fake",
+        tokenizer_id="fake-test",
+        tokenizer_revision=None,
+    )
+
+
+def test_workload_round_trip() -> None:
+    wl = _make_workload_provenance()
+    configuration = RunConfiguration(
+        endpoint="http://localhost:8000/v1",
+        model="test-model",
+        streaming=True,
+        max_output_tokens=64,
+    )
+    observations = RawObservations(
+        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
+        stream_events=[],
+        completion=Completion(offset_ns=100_000_000, wall_clock_utc="2025-01-01T00:00:01Z"),
+        usage=Usage(input_tokens=5, output_tokens=2, source=TokenCountSource.SERVER_REPORTED),
+    )
+    run = build_run(
+        run_id="workload-run",
+        started_at="2025-01-01T00:00:00Z",
+        configuration=configuration,
+        observations=observations,
+        workload=wl,
+    )
+
+    json_str = to_json(run)
+    restored = from_json(json_str)
+
+    assert restored.workload is not None
+    assert restored.workload.source == "builtin"
+    assert restored.workload.seed == 42
+    assert restored.workload.input_tokens_target == 100
+    assert restored.workload.output_tokens_target == 64
+    assert restored.workload.input_tokens_actual_local == 98
+    assert restored.workload.resolution_status == "nearest"
+    assert restored.workload.prompt_sha256 == wl.prompt_sha256
+    assert restored.workload.prompt_chars == 420
+    assert restored.workload.tokenizer_provider == "fake"
+    assert restored.workload.tokenizer_id == "fake-test"
+    assert restored.workload.tokenizer_revision is None
+
+
+def test_prompt_text_absent_from_artifact() -> None:
+    wl = _make_workload_provenance()
+    configuration = RunConfiguration(
+        endpoint="http://localhost:8000/v1",
+        model="test-model",
+        streaming=True,
+        max_output_tokens=64,
+    )
+    observations = RawObservations(
+        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
+        stream_events=[],
+        completion=Completion(offset_ns=100_000_000, wall_clock_utc="2025-01-01T00:00:01Z"),
+        usage=Usage(input_tokens=5, output_tokens=2, source=TokenCountSource.SERVER_REPORTED),
+    )
+    run = build_run(
+        run_id="no-prompt-run",
+        started_at="2025-01-01T00:00:00Z",
+        configuration=configuration,
+        observations=observations,
+        workload=wl,
+    )
+
+    json_str = to_json(run)
+    data = json.loads(json_str)
+    assert "prompt" not in data
+    assert "prompt_text" not in data
+    if data.get("workload"):
+        assert "prompt" not in data["workload"]
+
+
+def test_workload_tokenizer_revision_null_in_json() -> None:
+    wl = _make_workload_provenance()
+    assert wl.tokenizer_revision is None
+    configuration = RunConfiguration(
+        endpoint="http://localhost:8000/v1",
+        model="test-model",
+        streaming=True,
+        max_output_tokens=64,
+    )
+    observations = RawObservations(
+        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
+        stream_events=[],
+        completion=Completion(offset_ns=100_000_000, wall_clock_utc="2025-01-01T00:00:01Z"),
+        usage=Usage(input_tokens=5, output_tokens=2, source=TokenCountSource.SERVER_REPORTED),
+    )
+    run = build_run(
+        run_id="null-rev-run",
+        started_at="2025-01-01T00:00:00Z",
+        configuration=configuration,
+        observations=observations,
+        workload=wl,
+    )
+    data = json.loads(to_json(run))
+    assert data["workload"]["tokenizer_revision"] is None
+
+
+def test_local_count_and_server_input_tokens_differ_and_survive() -> None:
+    wl = WorkloadProvenance(
+        source="manual",
+        seed=0,
+        input_tokens_target=0,
+        output_tokens_target=64,
+        input_tokens_actual_local=7,
+        resolution_status="nearest",
+        prompt_sha256="a" * 64,
+        prompt_chars=7,
+        tokenizer_provider="fake",
+        tokenizer_id="fake-test",
+        tokenizer_revision=None,
+    )
+    configuration = RunConfiguration(
+        endpoint="http://localhost:8000/v1",
+        model="test-model",
+        streaming=True,
+        max_output_tokens=64,
+    )
+    observations = RawObservations(
+        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
+        stream_events=[],
+        completion=Completion(offset_ns=100_000_000, wall_clock_utc="2025-01-01T00:00:01Z"),
+        usage=Usage(input_tokens=15, output_tokens=2, source=TokenCountSource.SERVER_REPORTED),
+    )
+    run = build_run(
+        run_id="differ-run",
+        started_at="2025-01-01T00:00:00Z",
+        configuration=configuration,
+        observations=observations,
+        workload=wl,
+    )
+
+    json_str = to_json(run)
+    restored = from_json(json_str)
+
+    assert restored.workload.input_tokens_actual_local == 7
+    assert restored.usage.input_tokens == 15
+    assert restored.workload.input_tokens_actual_local != restored.usage.input_tokens
+
+
+def test_workload_none_default_in_build_run() -> None:
+    configuration = RunConfiguration(
+        endpoint="http://localhost:8000/v1",
+        model="test-model",
+        streaming=True,
+        max_output_tokens=64,
+    )
+    observations = RawObservations(
+        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
+        stream_events=[],
+        completion=Completion(offset_ns=100_000_000, wall_clock_utc="2025-01-01T00:00:01Z"),
+        usage=Usage(input_tokens=5, output_tokens=2, source=TokenCountSource.SERVER_REPORTED),
+    )
+    run = build_run(
+        run_id="no-wl-run",
+        started_at="2025-01-01T00:00:00Z",
+        configuration=configuration,
+        observations=observations,
+    )
+    assert run.workload is None

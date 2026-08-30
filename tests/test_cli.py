@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from llm_meter.cli import main
 from llm_meter.models import (
     Completion,
@@ -77,6 +79,7 @@ def test_run_one_produces_artifact(tmp_path: Path, capsys: object) -> None:
     assert data["response_established"] is None or isinstance(
         data["response_established"], dict
     )
+    assert "prompt" not in data
 
     captured = capsys.readouterr()
     assert "run_id" in captured.out
@@ -124,3 +127,273 @@ def test_run_one_error_exit_code(tmp_path: Path, capsys: object) -> None:
     assert "error" in captured.out
     assert "http_error" in captured.out
     assert "run_status" in captured.out
+
+
+def test_workload_inspect_help(capsys: object) -> None:
+    try:
+        main(["workload", "inspect", "--help"])
+    except SystemExit as exc:
+        assert exc.code == 0
+    captured = capsys.readouterr()
+    assert "inspect" in captured.out
+    assert "--input-tokens" in captured.out
+    assert "--output-tokens" in captured.out
+    assert "--tokenizer" in captured.out
+    assert "--seed" in captured.out
+
+
+def test_workload_inspect_produces_output(capsys: object) -> None:
+    exit_code = main([
+        "workload", "inspect",
+        "--tokenizer", "fake",
+        "--input-tokens", "50",
+        "--output-tokens", "64",
+        "--seed", "42",
+    ])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "input_tokens_target" in captured.out
+    assert "input_tokens_actual" in captured.out
+    assert "resolution" in captured.out
+    assert "prompt_sha256" in captured.out
+    assert "prompt_chars" in captured.out
+    assert "tokenizer" in captured.out
+
+
+def test_workload_inspect_show_prompt(capsys: object) -> None:
+    exit_code = main([
+        "workload", "inspect",
+        "--tokenizer", "fake",
+        "--input-tokens", "50",
+        "--output-tokens", "64",
+        "--seed", "42",
+        "--show-prompt",
+    ])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "--- prompt ---" in captured.out
+
+
+def test_run_one_with_input_tokens(tmp_path: Path, capsys: object) -> None:
+    fake_observations = RawObservations(
+        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
+        stream_events=[
+            StreamEvent(
+                sequence=0,
+                offset_ns=10_000_000,
+                event_type="content",
+                text_delta="Hello",
+            ),
+            StreamEvent(
+                sequence=1,
+                offset_ns=20_000_000,
+                event_type="metadata",
+                finish_reason="stop",
+            ),
+        ],
+        completion=Completion(offset_ns=30_000_000, wall_clock_utc="2025-01-01T00:00:01Z"),
+        usage=Usage(input_tokens=50, output_tokens=5, source=TokenCountSource.SERVER_REPORTED),
+    )
+
+    output_file = tmp_path / "run_input_tokens.json"
+
+    with patch("llm_meter.cli.stream_completion", return_value=fake_observations):
+        exit_code = main([
+            "run-one",
+            "--endpoint", "http://localhost:8000/v1",
+            "--model", "test-model",
+            "--tokenizer", "fake",
+            "--input-tokens", "50",
+            "--max-output-tokens", "64",
+            "--seed", "42",
+            "--output", str(output_file),
+        ])
+
+    assert exit_code == 0
+    assert output_file.exists()
+    data = json.loads(output_file.read_text())
+    assert data["workload"] is not None
+    assert data["workload"]["source"] == "builtin"
+    assert data["workload"]["input_tokens_target"] == 50
+    assert data["workload"]["output_tokens_target"] == 64
+    assert data["workload"]["tokenizer_provider"] == "fake"
+    assert data["workload"]["tokenizer_id"] == "fake"
+    assert data["workload"]["tokenizer_revision"] is None
+    assert "prompt" not in data
+
+
+def test_run_one_prompt_xor_input_tokens_rejected(tmp_path: Path, capsys: object) -> None:
+    output_file = tmp_path / "should_not_exist.json"
+    with pytest.raises(SystemExit) as exc_info:
+        main([
+            "run-one",
+            "--endpoint", "http://localhost:8000/v1",
+            "--model", "test-model",
+            "--prompt", "hi",
+            "--input-tokens", "50",
+            "--tokenizer", "fake",
+            "--max-output-tokens", "64",
+            "--output", str(output_file),
+        ])
+    assert exc_info.value.code != 0
+    captured = capsys.readouterr()
+    assert "mutually exclusive" in captured.err
+    assert not output_file.exists()
+
+
+def test_run_one_input_tokens_without_tokenizer_rejected(tmp_path: Path, capsys: object) -> None:
+    output_file = tmp_path / "should_not_exist.json"
+    with pytest.raises(SystemExit) as exc_info:
+        main([
+            "run-one",
+            "--endpoint", "http://localhost:8000/v1",
+            "--model", "test-model",
+            "--input-tokens", "50",
+            "--max-output-tokens", "64",
+            "--output", str(output_file),
+        ])
+    assert exc_info.value.code != 0
+    captured = capsys.readouterr()
+    assert "--tokenizer" in captured.err
+    assert not output_file.exists()
+
+
+def test_run_one_neither_prompt_nor_input_tokens_rejected(tmp_path: Path, capsys: object) -> None:
+    output_file = tmp_path / "should_not_exist.json"
+    with pytest.raises(SystemExit) as exc_info:
+        main([
+            "run-one",
+            "--endpoint", "http://localhost:8000/v1",
+            "--model", "test-model",
+            "--max-output-tokens", "64",
+            "--output", str(output_file),
+        ])
+    assert exc_info.value.code != 0
+    captured = capsys.readouterr()
+    assert "either" in captured.err.lower() or "--prompt" in captured.err
+
+
+def test_run_one_manual_prompt_with_tokenizer(tmp_path: Path, capsys: object) -> None:
+    fake_observations = RawObservations(
+        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
+        stream_events=[
+            StreamEvent(
+                sequence=0,
+                offset_ns=10_000_000,
+                event_type="content",
+                text_delta="Hello",
+            ),
+            StreamEvent(
+                sequence=1,
+                offset_ns=20_000_000,
+                event_type="metadata",
+                finish_reason="stop",
+            ),
+        ],
+        completion=Completion(offset_ns=30_000_000, wall_clock_utc="2025-01-01T00:00:01Z"),
+        usage=Usage(input_tokens=5, output_tokens=5, source=TokenCountSource.SERVER_REPORTED),
+    )
+
+    output_file = tmp_path / "manual_with_tok.json"
+
+    with patch("llm_meter.cli.stream_completion", return_value=fake_observations):
+        exit_code = main([
+            "run-one",
+            "--endpoint", "http://localhost:8000/v1",
+            "--model", "test-model",
+            "--prompt", "hello world",
+            "--tokenizer", "fake",
+            "--max-output-tokens", "64",
+            "--output", str(output_file),
+        ])
+
+    assert exit_code == 0
+    data = json.loads(output_file.read_text())
+    assert data["workload"]["source"] == "manual"
+    assert data["workload"]["input_tokens_actual_local"] == 11
+    assert data["workload"]["tokenizer_provider"] == "fake"
+
+
+def test_run_one_manual_prompt_without_tokenizer(tmp_path: Path, capsys: object) -> None:
+    fake_observations = RawObservations(
+        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
+        stream_events=[
+            StreamEvent(
+                sequence=0,
+                offset_ns=10_000_000,
+                event_type="content",
+                text_delta="Hello",
+            ),
+            StreamEvent(
+                sequence=1,
+                offset_ns=20_000_000,
+                event_type="metadata",
+                finish_reason="stop",
+            ),
+        ],
+        completion=Completion(offset_ns=30_000_000, wall_clock_utc="2025-01-01T00:00:01Z"),
+        usage=Usage(input_tokens=5, output_tokens=5, source=TokenCountSource.SERVER_REPORTED),
+    )
+
+    output_file = tmp_path / "manual_no_tok.json"
+
+    with patch("llm_meter.cli.stream_completion", return_value=fake_observations):
+        exit_code = main([
+            "run-one",
+            "--endpoint", "http://localhost:8000/v1",
+            "--model", "test-model",
+            "--prompt", "hello world",
+            "--max-output-tokens", "64",
+            "--output", str(output_file),
+        ])
+
+    assert exit_code == 0
+    data = json.loads(output_file.read_text())
+    assert data["workload"]["source"] == "manual"
+    assert data["workload"]["input_tokens_actual_local"] is None
+    assert data["workload"]["tokenizer_provider"] is None
+    assert data["workload"]["tokenizer_id"] is None
+    assert data["workload"]["tokenizer_revision"] is None
+    assert data["workload"]["prompt_sha256"] != ""
+    assert data["workload"]["prompt_chars"] == 11
+
+
+def test_run_one_local_and_server_input_tokens_differ(tmp_path: Path, capsys: object) -> None:
+    fake_observations = RawObservations(
+        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
+        stream_events=[
+            StreamEvent(
+                sequence=0,
+                offset_ns=10_000_000,
+                event_type="content",
+                text_delta="Hello",
+            ),
+            StreamEvent(
+                sequence=1,
+                offset_ns=20_000_000,
+                event_type="metadata",
+                finish_reason="stop",
+            ),
+        ],
+        completion=Completion(offset_ns=30_000_000, wall_clock_utc="2025-01-01T00:00:01Z"),
+        usage=Usage(input_tokens=50, output_tokens=5, source=TokenCountSource.SERVER_REPORTED),
+    )
+
+    output_file = tmp_path / "differ_tokens.json"
+
+    with patch("llm_meter.cli.stream_completion", return_value=fake_observations):
+        exit_code = main([
+            "run-one",
+            "--endpoint", "http://localhost:8000/v1",
+            "--model", "test-model",
+            "--tokenizer", "fake",
+            "--input-tokens", "50",
+            "--max-output-tokens", "64",
+            "--seed", "42",
+            "--output", str(output_file),
+        ])
+
+    assert exit_code == 0
+    data = json.loads(output_file.read_text())
+    assert data["workload"]["input_tokens_actual_local"] is not None
+    assert data["usage"]["input_tokens"] == 50

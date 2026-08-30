@@ -22,6 +22,7 @@ from llm_meter.models import (
     StreamEvent,
     TokenCountSource,
     Usage,
+    WorkloadProvenance,
     dataclass_to_dict,
 )
 
@@ -108,6 +109,7 @@ def build_run(
     started_at: str,
     configuration: RunConfiguration,
     observations: RawObservations,
+    workload: WorkloadProvenance | None = None,
 ) -> BenchmarkRun:
     metrics = derive_metrics(observations, observations.usage)
     provenance = Provenance(llm_meter_version=__version__)
@@ -141,6 +143,7 @@ def build_run(
         run_status=run_status,
         configuration=sanitized_config,
         provenance=provenance,
+        workload=workload,
         request_start=observations.request_start,
         response_established=observations.response_established,
         stream_events=observations.stream_events,
@@ -259,6 +262,23 @@ def _dict_to_run(obj: dict[str, Any]) -> BenchmarkRun:
         llm_meter_version=obj.get("provenance", {}).get("llm_meter_version", ""),
     )
 
+    workload = None
+    if obj.get("workload"):
+        w = obj["workload"]
+        workload = WorkloadProvenance(
+            source=w["source"],
+            seed=w["seed"],
+            input_tokens_target=w["input_tokens_target"],
+            output_tokens_target=w["output_tokens_target"],
+            input_tokens_actual_local=w.get("input_tokens_actual_local"),
+            resolution_status=w.get("resolution_status", "unresolvable"),
+            prompt_sha256=w.get("prompt_sha256", ""),
+            prompt_chars=w.get("prompt_chars", 0),
+            tokenizer_provider=w.get("tokenizer_provider"),
+            tokenizer_id=w.get("tokenizer_id"),
+            tokenizer_revision=w.get("tokenizer_revision"),
+        )
+
     return BenchmarkRun(
         schema_version=obj["schema_version"],
         run_id=obj["run_id"],
@@ -266,6 +286,7 @@ def _dict_to_run(obj: dict[str, Any]) -> BenchmarkRun:
         run_status=obj.get("run_status", RunStatus.FAILED.value),
         configuration=configuration,
         provenance=provenance,
+        workload=workload,
         request_start=request_start,
         response_established=response_established,
         stream_events=stream_events,
