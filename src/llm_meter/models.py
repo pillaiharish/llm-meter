@@ -20,10 +20,22 @@ class TpotStatus(StrEnum):
     NO_E2E = "no_e2e"
 
 
+class RunStatus(StrEnum):
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 @dataclass
 class RequestStart:
     offset_ns: int
     wall_clock_utc: str
+
+
+@dataclass
+class ResponseEstablished:
+    offset_ns: int
+    status_code: int
+    content_type: str | None = None
 
 
 @dataclass
@@ -85,20 +97,23 @@ class BenchmarkRun:
     schema_version: str
     run_id: str
     started_at: str
+    run_status: str
     configuration: RunConfiguration
+    provenance: Provenance
     request_start: RequestStart | None = None
+    response_established: ResponseEstablished | None = None
     stream_events: list[StreamEvent] = field(default_factory=list)
     completion: Completion | None = None
     error: ErrorObservation | None = None
     usage: Usage = field(default_factory=Usage)
     metrics: ClientMetrics = field(default_factory=ClientMetrics)
-    provenance: Provenance = field(default_factory=Provenance)
 
 
 @dataclass
 class RawObservations:
     request_start: RequestStart
     stream_events: list[StreamEvent]
+    response_established: ResponseEstablished | None = None
     completion: Completion | None = None
     error: ErrorObservation | None = None
     usage: Usage = field(default_factory=Usage)

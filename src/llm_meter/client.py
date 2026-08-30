@@ -12,6 +12,7 @@ from llm_meter.models import (
     ErrorObservation,
     RawObservations,
     RequestStart,
+    ResponseEstablished,
     StreamEvent,
     TokenCountSource,
     Usage,
@@ -68,14 +69,12 @@ def _classify_event(
         choice = choices[0]
         delta = choice.get("delta", {})
         content = delta.get("content")
-        if content is not None:
+        if content:
             event_type = "content"
             text_delta = content
         fr = choice.get("finish_reason")
         if fr is not None:
             finish_reason = fr
-        if finish_reason is not None:
-            event_type = "metadata" if content is None else "content"
 
     if "usage" in data and data["usage"] is not None:
         usage = data["usage"]
@@ -122,14 +121,9 @@ async def stream_completion(
     if max_output_tokens is not None:
         body["max_tokens"] = max_output_tokens
 
-    clock.start()
-    request_start = RequestStart(
-        offset_ns=0,
-        wall_clock_utc=Clock.wall_clock_utc(),
-    )
-
     stream_events: list[StreamEvent] = []
     completion: Completion | None = None
+    response_established: ResponseEstablished | None = None
     error: ErrorObservation | None = None
     usage = Usage(source=TokenCountSource.UNKNOWN)
     sequence = 0
@@ -140,6 +134,12 @@ async def stream_completion(
 
     try:
         async with httpx.AsyncClient(**client_kwargs) as client:
+            clock.start()
+            request_start = RequestStart(
+                offset_ns=0,
+                wall_clock_utc=Clock.wall_clock_utc(),
+            )
+
             async with client.stream(
                 "POST",
                 url,
@@ -147,6 +147,12 @@ async def stream_completion(
                 headers=headers,
                 timeout=httpx.Timeout(60.0, connect=10.0),
             ) as response:
+                response_established = ResponseEstablished(
+                    offset_ns=clock.now_offset_ns(),
+                    status_code=response.status_code,
+                    content_type=response.headers.get("content-type"),
+                )
+
                 if response.status_code >= 400:
                     error = ErrorObservation(
                         offset_ns=clock.now_offset_ns(),
@@ -157,20 +163,21 @@ async def stream_completion(
                     return RawObservations(
                         request_start=request_start,
                         stream_events=stream_events,
+                        response_established=response_established,
                         completion=completion,
                         error=error,
                         usage=usage,
                     )
 
-                saw_done = False
                 async for line in response.aiter_lines():
                     if not line.strip():
                         continue
+                    receive_offset_ns = clock.now_offset_ns()
                     try:
                         parsed = parse_sse_data(line)
                     except SSEParseError as exc:
                         error = ErrorObservation(
-                            offset_ns=clock.now_offset_ns(),
+                            offset_ns=receive_offset_ns,
                             category="sse_parse",
                             exception_type=type(exc).__name__,
                             message=str(exc),
@@ -178,14 +185,18 @@ async def stream_completion(
                         return RawObservations(
                             request_start=request_start,
                             stream_events=stream_events,
+                            response_established=response_established,
                             completion=completion,
                             error=error,
                             usage=usage,
                         )
 
                     if parsed is DONE:
-                        saw_done = True
-                        continue
+                        completion = Completion(
+                            offset_ns=receive_offset_ns,
+                            wall_clock_utc=Clock.wall_clock_utc(),
+                        )
+                        break
                     if not parsed:
                         continue
 
@@ -197,7 +208,7 @@ async def stream_completion(
                     stream_events.append(
                         StreamEvent(
                             sequence=sequence,
-                            offset_ns=clock.now_offset_ns(),
+                            offset_ns=receive_offset_ns,
                             event_type=event_type,
                             text_delta=text_delta,
                             finish_reason=finish_reason,
@@ -206,28 +217,23 @@ async def stream_completion(
                     )
                     sequence += 1
 
-                if not saw_done:
+                if completion is None:
                     error = ErrorObservation(
                         offset_ns=clock.now_offset_ns(),
                         category="stream_unexpected_end",
                         message="stream ended without [DONE]",
                     )
-                else:
-                    completion = Completion(
-                        offset_ns=clock.now_offset_ns(),
-                        wall_clock_utc=Clock.wall_clock_utc(),
-                    )
 
     except httpx.TransportError as exc:
         error = ErrorObservation(
-            offset_ns=clock.now_offset_ns(),
+            offset_ns=clock.now_offset_ns() if clock._origin_ns is not None else 0,
             category="transport",
             exception_type=type(exc).__name__,
             message=str(exc),
         )
     except httpx.HTTPError as exc:
         error = ErrorObservation(
-            offset_ns=clock.now_offset_ns(),
+            offset_ns=clock.now_offset_ns() if clock._origin_ns is not None else 0,
             category="http_error",
             exception_type=type(exc).__name__,
             message=str(exc),
@@ -236,6 +242,7 @@ async def stream_completion(
     return RawObservations(
         request_start=request_start,
         stream_events=stream_events,
+        response_established=response_established,
         completion=completion,
         error=error,
         usage=usage,

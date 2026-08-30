@@ -238,3 +238,28 @@ def test_no_ttft_no_tpot() -> None:
     assert metrics.client_ttft_ns is None
     assert metrics.tpot_ns is None
     assert metrics.tpot_status == TpotStatus.NO_TTFT.value
+
+
+def test_empty_content_not_content_type() -> None:
+    events = [
+        StreamEvent(
+            sequence=0,
+            offset_ns=10_000_000,
+            event_type="metadata",
+            text_delta="",
+        ),
+        StreamEvent(
+            sequence=1,
+            offset_ns=50_000_000,
+            event_type="content",
+            text_delta="Hello",
+        ),
+    ]
+    obs = _make_observations(
+        stream_events=events,
+        completion=Completion(offset_ns=100_000_000, wall_clock_utc="2025-01-01T00:00:00Z"),
+    )
+
+    metrics = derive_metrics(obs)
+
+    assert metrics.client_ttft_ns == 50_000_000

@@ -3,14 +3,26 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from llm_meter import __version__
-from llm_meter.artifact import SCHEMA_VERSION, build_run, from_json, to_json, write_artifact
+from llm_meter.artifact import (
+    SCHEMA_VERSION,
+    UnsupportedSchemaVersion,
+    build_run,
+    from_json,
+    sanitize_endpoint,
+    to_json,
+    write_artifact,
+)
 from llm_meter.models import (
     Completion,
     ErrorObservation,
     RawObservations,
     RequestStart,
+    ResponseEstablished,
     RunConfiguration,
+    RunStatus,
     StreamEvent,
     TokenCountSource,
     Usage,
@@ -26,6 +38,11 @@ def _make_run():
     )
     observations = RawObservations(
         request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
+        response_established=ResponseEstablished(
+            offset_ns=5_000_000,
+            status_code=200,
+            content_type="text/event-stream",
+        ),
         stream_events=[
             StreamEvent(sequence=0, offset_ns=10_000_000, event_type="metadata"),
             StreamEvent(
@@ -74,10 +91,12 @@ def test_json_round_trip() -> None:
     assert restored.schema_version == run.schema_version
     assert restored.run_id == run.run_id
     assert restored.started_at == run.started_at
+    assert restored.run_status == run.run_status
     assert restored.configuration.endpoint == run.configuration.endpoint
     assert restored.configuration.model == run.configuration.model
     assert restored.configuration.streaming == run.configuration.streaming
     assert restored.request_start.offset_ns == run.request_start.offset_ns
+    assert restored.response_established.status_code == run.response_established.status_code
     assert len(restored.stream_events) == len(run.stream_events)
     assert restored.completion.offset_ns == run.completion.offset_ns
     assert restored.usage.input_tokens == run.usage.input_tokens
@@ -105,6 +124,7 @@ def test_ns_fields_are_integers() -> None:
     data = json.loads(to_json(run))
 
     assert isinstance(data["request_start"]["offset_ns"], int)
+    assert isinstance(data["response_established"]["offset_ns"], int)
     assert isinstance(data["completion"]["offset_ns"], int)
     for event in data["stream_events"]:
         assert isinstance(event["offset_ns"], int)
@@ -124,6 +144,7 @@ def test_absent_data_is_null_not_fabricated() -> None:
     observations = RawObservations(
         request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
         stream_events=[],
+        response_established=None,
         completion=None,
         error=ErrorObservation(
             offset_ns=100_000_000,
@@ -142,6 +163,7 @@ def test_absent_data_is_null_not_fabricated() -> None:
 
     data = json.loads(to_json(run))
 
+    assert data["response_established"] is None
     assert data["completion"] is None
     assert data["error"] is not None
     assert data["error"]["category"] == "http_error"
@@ -152,6 +174,7 @@ def test_absent_data_is_null_not_fabricated() -> None:
     assert data["metrics"]["client_ttft_ns"] is None
     assert data["metrics"]["e2e_latency_ns"] is None
     assert data["metrics"]["tpot_ns"] is None
+    assert data["run_status"] == RunStatus.FAILED.value
 
 
 def test_write_artifact_to_file(tmp_path: Path) -> None:
@@ -169,3 +192,139 @@ def test_provenance_has_version() -> None:
     run = _make_run()
     data = json.loads(to_json(run))
     assert data["provenance"]["llm_meter_version"] == __version__
+
+
+def test_provenance_required_field() -> None:
+    with pytest.raises(TypeError):
+        BenchmarkRun = __import__(
+            "llm_meter.models", fromlist=["BenchmarkRun"]
+        ).BenchmarkRun
+        BenchmarkRun(
+            schema_version="1",
+            run_id="test",
+            started_at="2025-01-01T00:00:00Z",
+            run_status="completed",
+            configuration=RunConfiguration(
+                endpoint="http://localhost:8000/v1",
+                model="test",
+                streaming=True,
+            ),
+        )
+
+
+def test_unsupported_schema_version_rejected() -> None:
+    future_json = json.dumps({
+        "schema_version": "2",
+        "run_id": "test",
+        "started_at": "2025-01-01T00:00:00Z",
+        "run_status": "completed",
+        "configuration": {
+            "endpoint": "http://localhost:8000/v1",
+            "model": "test",
+            "streaming": True,
+        },
+        "provenance": {"llm_meter_version": "0.1.0.dev0"},
+    })
+    with pytest.raises(UnsupportedSchemaVersion) as exc_info:
+        from_json(future_json)
+    assert "2" in str(exc_info.value)
+    assert SCHEMA_VERSION in str(exc_info.value)
+
+
+def test_missing_schema_version_rejected() -> None:
+    no_version_json = json.dumps({
+        "run_id": "test",
+        "started_at": "2025-01-01T00:00:00Z",
+        "run_status": "completed",
+        "configuration": {
+            "endpoint": "http://localhost:8000/v1",
+            "model": "test",
+            "streaming": True,
+        },
+        "provenance": {"llm_meter_version": "0.1.0.dev0"},
+    })
+    with pytest.raises(UnsupportedSchemaVersion) as exc_info:
+        from_json(no_version_json)
+    assert "missing" in str(exc_info.value).lower()
+
+
+def test_endpoint_credentials_redacted() -> None:
+    configuration = RunConfiguration(
+        endpoint="https://user:password@example.test/v1?api_key=secret&region=us",
+        model="test-model",
+        streaming=True,
+    )
+    observations = RawObservations(
+        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
+        stream_events=[],
+        completion=Completion(offset_ns=100_000_000, wall_clock_utc="2025-01-01T00:00:01Z"),
+        usage=Usage(source=TokenCountSource.UNKNOWN),
+    )
+    run = build_run(
+        run_id="redact-test",
+        started_at="2025-01-01T00:00:00Z",
+        configuration=configuration,
+        observations=observations,
+    )
+
+    json_str = to_json(run)
+    assert "user:password" not in json_str
+    assert "secret" not in json_str
+    assert "password" not in json_str
+    assert "example.test" in json_str
+    assert "region=us" in json_str
+    assert "***REDACTED***" in json_str
+
+
+def test_api_key_not_in_error_output() -> None:
+    configuration = RunConfiguration(
+        endpoint="http://localhost:8000/v1",
+        model="test-model",
+        streaming=True,
+    )
+    observations = RawObservations(
+        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
+        stream_events=[],
+        error=ErrorObservation(
+            offset_ns=10_000_000,
+            category="http_error",
+            status=401,
+            message="Unauthorized",
+        ),
+        usage=Usage(source=TokenCountSource.UNKNOWN),
+    )
+    run = build_run(
+        run_id="error-test",
+        started_at="2025-01-01T00:00:00Z",
+        configuration=configuration,
+        observations=observations,
+    )
+
+    json_str = to_json(run)
+    assert "secret-key-12345" not in json_str
+    assert "Bearer" not in json_str
+
+
+def test_run_status_in_artifact() -> None:
+    run = _make_run()
+    data = json.loads(to_json(run))
+    assert data["run_status"] == RunStatus.COMPLETED.value
+
+
+def test_sanitize_endpoint_strips_userinfo() -> None:
+    result = sanitize_endpoint("https://user:pass@host.example/v1")
+    assert "user:pass" not in result
+    assert "host.example" in result
+    assert "/v1" in result
+
+
+def test_sanitize_endpoint_redacts_query_params() -> None:
+    result = sanitize_endpoint("https://host.example/v1?api_key=secret&region=us")
+    assert "secret" not in result
+    assert "***REDACTED***" in result
+    assert "region=us" in result
+
+
+def test_sanitize_endpoint_preserves_clean_url() -> None:
+    result = sanitize_endpoint("http://localhost:8000/v1")
+    assert result == "http://localhost:8000/v1"

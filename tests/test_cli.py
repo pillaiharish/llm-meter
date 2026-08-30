@@ -73,10 +73,15 @@ def test_run_one_produces_artifact(tmp_path: Path, capsys: object) -> None:
     assert data["metrics"]["client_ttft_ns"] == 10_000_000
     assert data["metrics"]["e2e_latency_ns"] == 30_000_000
     assert data["error"] is None
+    assert data["run_status"] == "completed"
+    assert data["response_established"] is None or isinstance(
+        data["response_established"], dict
+    )
 
     captured = capsys.readouterr()
     assert "run_id" in captured.out
     assert "schema_version" in captured.out
+    assert "run_status" in captured.out
     assert "client_ttft" in captured.out
     assert "e2e_latency" in captured.out
 
@@ -113,7 +118,9 @@ def test_run_one_error_exit_code(tmp_path: Path, capsys: object) -> None:
     assert data["error"] is not None
     assert data["error"]["category"] == "http_error"
     assert data["error"]["status"] == 500
+    assert data["run_status"] == "failed"
 
     captured = capsys.readouterr()
     assert "error" in captured.out
     assert "http_error" in captured.out
+    assert "run_status" in captured.out

@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 
 from llm_meter.client import FakeClock, stream_completion
-from llm_meter.models import TokenCountSource
+from llm_meter.models import RunStatus, TokenCountSource
 
 
 def _make_sse_response(
@@ -49,6 +49,12 @@ def _finish(finish_reason: str = "stop", usage: dict[str, Any] | None = None) ->
     return data
 
 
+def asyncio_run(coro):
+    import asyncio
+
+    return asyncio.run(coro)
+
+
 def test_successful_streaming_response() -> None:
     transport = _make_sse_response([
         _role_delta(),
@@ -57,7 +63,7 @@ def test_successful_streaming_response() -> None:
         _finish("stop", {"prompt_tokens": 5, "completion_tokens": 2}),
         "[DONE]",
     ])
-    clock = FakeClock([10_000_000, 20_000_000, 30_000_000, 40_000_000, 50_000_000])
+    clock = FakeClock([5_000_000, 10_000_000, 20_000_000, 30_000_000, 40_000_000, 50_000_000])
 
     result = asyncio_run(
         stream_completion(
@@ -72,6 +78,8 @@ def test_successful_streaming_response() -> None:
 
     assert result.error is None
     assert result.completion is not None
+    assert result.response_established is not None
+    assert result.response_established.status_code == 200
     assert len(result.stream_events) == 4
     assert result.stream_events[0].event_type == "metadata"
     assert result.stream_events[1].event_type == "content"
@@ -89,7 +97,7 @@ def test_metadata_only_before_content_not_ttft() -> None:
         _finish("stop"),
         "[DONE]",
     ])
-    clock = FakeClock([10_000_000, 40_000_000, 10_000_000, 10_000_000])
+    clock = FakeClock([5_000_000, 10_000_000, 40_000_000, 10_000_000, 10_000_000])
 
     result = asyncio_run(
         stream_completion(
@@ -103,9 +111,9 @@ def test_metadata_only_before_content_not_ttft() -> None:
 
     content_events = [e for e in result.stream_events if e.event_type == "content"]
     assert len(content_events) == 1
-    assert content_events[0].offset_ns == 50_000_000
+    assert content_events[0].offset_ns == 55_000_000
     metadata_events = [e for e in result.stream_events if e.event_type == "metadata"]
-    assert metadata_events[0].offset_ns == 10_000_000
+    assert metadata_events[0].offset_ns == 15_000_000
 
 
 def test_no_content_bearing_event() -> None:
@@ -114,7 +122,7 @@ def test_no_content_bearing_event() -> None:
         _finish("stop"),
         "[DONE]",
     ])
-    clock = FakeClock([10_000_000, 20_000_000, 30_000_000])
+    clock = FakeClock([5_000_000, 10_000_000, 20_000_000, 30_000_000])
 
     result = asyncio_run(
         stream_completion(
@@ -136,7 +144,7 @@ def test_response_with_usage() -> None:
         _finish("stop", {"prompt_tokens": 3, "completion_tokens": 1}),
         "[DONE]",
     ])
-    clock = FakeClock([10_000_000, 20_000_000, 30_000_000])
+    clock = FakeClock([5_000_000, 10_000_000, 20_000_000, 30_000_000])
 
     result = asyncio_run(
         stream_completion(
@@ -159,7 +167,7 @@ def test_response_without_usage() -> None:
         _finish("stop"),
         "[DONE]",
     ])
-    clock = FakeClock([10_000_000, 20_000_000, 30_000_000])
+    clock = FakeClock([5_000_000, 10_000_000, 20_000_000, 30_000_000])
 
     result = asyncio_run(
         stream_completion(
@@ -177,7 +185,7 @@ def test_response_without_usage() -> None:
 
 def test_http_error() -> None:
     transport = _make_sse_response([], status_code=500)
-    clock = FakeClock([10_000_000])
+    clock = FakeClock([10_000_000, 20_000_000])
 
     result = asyncio_run(
         stream_completion(
@@ -193,13 +201,15 @@ def test_http_error() -> None:
     assert result.error.category == "http_error"
     assert result.error.status == 500
     assert result.completion is None
+    assert result.response_established is not None
+    assert result.response_established.status_code == 500
 
 
 def test_malformed_sse_event() -> None:
     transport = _make_sse_response([
         "data: {invalid json}",
     ])
-    clock = FakeClock([10_000_000])
+    clock = FakeClock([5_000_000, 10_000_000])
 
     result = asyncio_run(
         stream_completion(
@@ -219,7 +229,7 @@ def test_stream_ending_unexpectedly() -> None:
     transport = _make_sse_response([
         _content_delta("Hi"),
     ])
-    clock = FakeClock([10_000_000, 20_000_000])
+    clock = FakeClock([5_000_000, 10_000_000, 20_000_000])
 
     result = asyncio_run(
         stream_completion(
@@ -245,7 +255,9 @@ def test_multiple_content_chunks() -> None:
         _finish("stop"),
         "[DONE]",
     ])
-    clock = FakeClock([10_000_000, 20_000_000, 30_000_000, 40_000_000, 50_000_000, 60_000_000])
+    clock = FakeClock([
+        5_000_000, 10_000_000, 20_000_000, 30_000_000, 40_000_000, 50_000_000, 60_000_000,
+    ])
 
     result = asyncio_run(
         stream_completion(
@@ -267,7 +279,7 @@ def test_partial_artifact_on_error() -> None:
         _content_delta("partial"),
         "data: {bad json}",
     ])
-    clock = FakeClock([10_000_000, 20_000_000, 30_000_000])
+    clock = FakeClock([5_000_000, 10_000_000, 20_000_000])
 
     result = asyncio_run(
         stream_completion(
@@ -285,13 +297,13 @@ def test_partial_artifact_on_error() -> None:
     assert result.stream_events[0].text_delta == "partial"
 
 
-def test_no_api_key_in_headers() -> None:
+def test_no_api_key_in_observations() -> None:
     transport = _make_sse_response([
         _content_delta("Hi"),
         _finish("stop"),
         "[DONE]",
     ])
-    clock = FakeClock([10_000_000, 20_000_000, 30_000_000])
+    clock = FakeClock([5_000_000, 10_000_000, 20_000_000, 30_000_000])
 
     result = asyncio_run(
         stream_completion(
@@ -310,7 +322,270 @@ def test_no_api_key_in_headers() -> None:
     assert "secret-key-12345" not in json.dumps(result.__dict__, default=str)
 
 
-def asyncio_run(coro):
-    import asyncio
+def test_done_timestamp_defines_completion() -> None:
+    transport = _make_sse_response([
+        _content_delta("Hello"),
+        "[DONE]",
+    ])
+    clock = FakeClock([5_000_000, 10_000_000, 90_000_000])
 
-    return asyncio.run(coro)
+    result = asyncio_run(
+        stream_completion(
+            endpoint="http://localhost:8000/v1",
+            model="test-model",
+            prompt="hi",
+            clock=clock,
+            transport=transport,
+        )
+    )
+
+    assert result.error is None
+    assert result.completion is not None
+    assert result.completion.offset_ns == 105_000_000
+
+
+def test_trailing_data_after_done_ignored() -> None:
+    transport = _make_sse_response([
+        _content_delta("Hello"),
+        "[DONE]",
+        _content_delta("trailing"),
+    ])
+    clock = FakeClock([5_000_000, 10_000_000, 90_000_000, 100_000_000])
+
+    result = asyncio_run(
+        stream_completion(
+            endpoint="http://localhost:8000/v1",
+            model="test-model",
+            prompt="hi",
+            clock=clock,
+            transport=transport,
+        )
+    )
+
+    assert result.error is None
+    assert result.completion is not None
+    assert result.completion.offset_ns == 105_000_000
+    content_events = [e for e in result.stream_events if e.event_type == "content"]
+    assert len(content_events) == 1
+    assert content_events[0].text_delta == "Hello"
+    assert "trailing" not in [e.text_delta for e in result.stream_events]
+
+
+def test_eof_time_not_used_for_e2e_after_done() -> None:
+    transport = _make_sse_response([
+        _content_delta("Hello"),
+        "[DONE]",
+    ])
+    clock = FakeClock([5_000_000, 10_000_000, 90_000_000])
+
+    result = asyncio_run(
+        stream_completion(
+            endpoint="http://localhost:8000/v1",
+            model="test-model",
+            prompt="hi",
+            clock=clock,
+            transport=transport,
+        )
+    )
+
+    assert result.completion is not None
+    assert result.completion.offset_ns == 105_000_000
+    from llm_meter.metrics import derive_metrics
+
+    metrics = derive_metrics(result)
+    assert metrics.e2e_latency_ns == 105_000_000
+
+
+def test_receive_offset_captured_before_parsing() -> None:
+    transport = _make_sse_response([
+        _content_delta("Hello"),
+        "[DONE]",
+    ])
+    clock = FakeClock([5_000_000, 30_000_000, 70_000_000])
+
+    result = asyncio_run(
+        stream_completion(
+            endpoint="http://localhost:8000/v1",
+            model="test-model",
+            prompt="hi",
+            clock=clock,
+            transport=transport,
+        )
+    )
+
+    assert len(result.stream_events) == 1
+    assert result.stream_events[0].offset_ns == 35_000_000
+    assert result.completion is not None
+    assert result.completion.offset_ns == 105_000_000
+
+
+def test_empty_content_does_not_trigger_ttft() -> None:
+    transport = _make_sse_response([
+        _role_delta(),
+        _content_delta(""),
+        _content_delta("Hello"),
+        _finish("stop"),
+        "[DONE]",
+    ])
+    clock = FakeClock([5_000_000, 10_000_000, 10_000_000, 40_000_000, 10_000_000, 10_000_000])
+
+    result = asyncio_run(
+        stream_completion(
+            endpoint="http://localhost:8000/v1",
+            model="test-model",
+            prompt="hi",
+            clock=clock,
+            transport=transport,
+        )
+    )
+
+    content_events = [e for e in result.stream_events if e.event_type == "content"]
+    assert len(content_events) == 1
+    assert content_events[0].text_delta == "Hello"
+    assert content_events[0].offset_ns == 65_000_000
+    metadata_events = [e for e in result.stream_events if e.event_type == "metadata"]
+    assert len(metadata_events) == 3
+    empty_content_deltas = [
+        e for e in result.stream_events if e.text_delta is None and e.event_type == "metadata"
+    ]
+    assert len(empty_content_deltas) >= 1
+
+
+def test_response_established_captured() -> None:
+    transport = _make_sse_response([
+        _content_delta("Hi"),
+        _finish("stop"),
+        "[DONE]",
+    ])
+    clock = FakeClock([5_000_000, 10_000_000, 20_000_000, 30_000_000])
+
+    result = asyncio_run(
+        stream_completion(
+            endpoint="http://localhost:8000/v1",
+            model="test-model",
+            prompt="hi",
+            clock=clock,
+            transport=transport,
+        )
+    )
+
+    assert result.response_established is not None
+    assert result.response_established.status_code == 200
+    assert result.response_established.offset_ns == 5_000_000
+    assert result.response_established.content_type == "text/event-stream"
+
+
+def test_response_established_on_http_error() -> None:
+    transport = _make_sse_response([], status_code=403)
+    clock = FakeClock([10_000_000, 20_000_000])
+
+    result = asyncio_run(
+        stream_completion(
+            endpoint="http://localhost:8000/v1",
+            model="test-model",
+            prompt="hi",
+            clock=clock,
+            transport=transport,
+        )
+    )
+
+    assert result.response_established is not None
+    assert result.response_established.status_code == 403
+    assert result.error is not None
+    assert result.error.category == "http_error"
+
+
+def test_run_status_completed() -> None:
+    transport = _make_sse_response([
+        _content_delta("Hi"),
+        _finish("stop"),
+        "[DONE]",
+    ])
+    clock = FakeClock([5_000_000, 10_000_000, 20_000_000, 30_000_000])
+
+    result = asyncio_run(
+        stream_completion(
+            endpoint="http://localhost:8000/v1",
+            model="test-model",
+            prompt="hi",
+            clock=clock,
+            transport=transport,
+        )
+    )
+
+    from llm_meter.artifact import build_run
+    from llm_meter.models import RunConfiguration
+
+    run = build_run(
+        run_id="test-id",
+        started_at="2025-01-01T00:00:00Z",
+        configuration=RunConfiguration(
+            endpoint="http://localhost:8000/v1",
+            model="test-model",
+            streaming=True,
+        ),
+        observations=result,
+    )
+    assert run.run_status == RunStatus.COMPLETED.value
+
+
+def test_run_status_failed_on_http_error() -> None:
+    transport = _make_sse_response([], status_code=500)
+    clock = FakeClock([10_000_000, 20_000_000])
+
+    result = asyncio_run(
+        stream_completion(
+            endpoint="http://localhost:8000/v1",
+            model="test-model",
+            prompt="hi",
+            clock=clock,
+            transport=transport,
+        )
+    )
+
+    from llm_meter.artifact import build_run
+    from llm_meter.models import RunConfiguration
+
+    run = build_run(
+        run_id="test-id",
+        started_at="2025-01-01T00:00:00Z",
+        configuration=RunConfiguration(
+            endpoint="http://localhost:8000/v1",
+            model="test-model",
+            streaming=True,
+        ),
+        observations=result,
+    )
+    assert run.run_status == RunStatus.FAILED.value
+
+
+def test_run_status_failed_on_unexpected_eof() -> None:
+    transport = _make_sse_response([
+        _content_delta("Hi"),
+    ])
+    clock = FakeClock([5_000_000, 10_000_000, 20_000_000])
+
+    result = asyncio_run(
+        stream_completion(
+            endpoint="http://localhost:8000/v1",
+            model="test-model",
+            prompt="hi",
+            clock=clock,
+            transport=transport,
+        )
+    )
+
+    from llm_meter.artifact import build_run
+    from llm_meter.models import RunConfiguration
+
+    run = build_run(
+        run_id="test-id",
+        started_at="2025-01-01T00:00:00Z",
+        configuration=RunConfiguration(
+            endpoint="http://localhost:8000/v1",
+            model="test-model",
+            streaming=True,
+        ),
+        observations=result,
+    )
+    assert run.run_status == RunStatus.FAILED.value

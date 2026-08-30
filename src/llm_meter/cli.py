@@ -91,6 +91,7 @@ def _run_one(args: argparse.Namespace) -> int:
 
     print(f"run_id:           {run.run_id}")
     print(f"schema_version:   {run.schema_version}")
+    print(f"run_status:       {run.run_status}")
     print(f"artifact:         {output_path}")
     print(f"client_ttft:      {_format_ms(run.metrics.client_ttft_ns)}")
     print(f"e2e_latency:      {_format_ms(run.metrics.e2e_latency_ns)}")
