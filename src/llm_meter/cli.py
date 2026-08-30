@@ -6,11 +6,13 @@ import os
 import sys
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 from llm_meter import __version__
-from llm_meter.artifact import build_run, write_artifact
+from llm_meter.artifact import build_run, write_artifact, write_session
 from llm_meter.client import Clock, stream_completion
 from llm_meter.models import RunConfiguration, WorkloadProvenance
+from llm_meter.runner import BenchmarkPlan, RequestExecutor, run_session
 from llm_meter.tokenizer import load_tokenizer
 from llm_meter.workload import (
     PromptSource,
@@ -68,6 +70,61 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_one.add_argument(
         "--output", default="run.json", help="Output artifact path (default: run.json)"
+    )
+
+    run_batch = subparsers.add_parser(
+        "run-batch",
+        help="Execute warmup + measured requests at fixed concurrency (experimental).",
+    )
+    run_batch.add_argument(
+        "--endpoint", required=True, help="OpenAI-compatible base URL (e.g. http://localhost:8000/v1)"
+    )
+    run_batch.add_argument("--model", required=True, help="Model name")
+    run_batch.add_argument(
+        "--prompt", default=None, help="Prompt text (mutually exclusive with --input-tokens)"
+    )
+    run_batch.add_argument(
+        "--tokenizer",
+        default=None,
+        help="Tokenizer ID for local token counting / prompt construction",
+    )
+    run_batch.add_argument(
+        "--input-tokens",
+        type=int,
+        default=None,
+        help="Target input token count (requires --tokenizer, mutually exclusive with --prompt)",
+    )
+    run_batch.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=None,
+        help="Maximum output tokens (also used as workload output_tokens_target)",
+    )
+    run_batch.add_argument(
+        "--warmup-requests",
+        type=int,
+        default=0,
+        help="Number of warmup requests (default: 0)",
+    )
+    run_batch.add_argument(
+        "--requests",
+        type=int,
+        required=True,
+        help="Number of measured requests (must be > 0)",
+    )
+    run_batch.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Maximum simultaneous in-flight requests (default: 1)",
+    )
+    run_batch.add_argument(
+        "--seed", type=int, default=0, help="Deterministic workload seed (default: 0)"
+    )
+    run_batch.add_argument(
+        "--output",
+        default="session.json",
+        help="Output session artifact path (default: session.json)",
     )
 
     workload_parser = subparsers.add_parser("workload", help="Workload specification tools")
@@ -139,9 +196,9 @@ def _validate_cli_inputs(args: argparse.Namespace) -> None:
         _fail("--input-tokens must be positive")
 
 
-def _resolve_prompt(args: argparse.Namespace) -> tuple[str, RequestSpec, str]:
-    _validate_cli_inputs(args)
-
+def _build_workload_spec(
+    args: argparse.Namespace,
+) -> tuple[WorkloadSpec, str | None, str]:
     if args.prompt is not None:
         spec = WorkloadSpec(
             input_tokens_target=None,
@@ -150,9 +207,7 @@ def _resolve_prompt(args: argparse.Namespace) -> tuple[str, RequestSpec, str]:
             prompt_source=PromptSource.MANUAL.value,
             tokenizer_id=args.tokenizer,
         )
-        tokenizer = load_tokenizer(args.tokenizer)
-        request_spec = resolve_workload(spec, tokenizer, manual_prompt=args.prompt)
-        return args.prompt, request_spec, PromptSource.MANUAL.value
+        return spec, args.prompt, PromptSource.MANUAL.value
 
     if args.input_tokens is not None:
         if not args.tokenizer:
@@ -166,11 +221,19 @@ def _resolve_prompt(args: argparse.Namespace) -> tuple[str, RequestSpec, str]:
             prompt_source=PromptSource.BUILTIN.value,
             tokenizer_id=args.tokenizer,
         )
-        tokenizer = load_tokenizer(args.tokenizer)
-        request_spec = resolve_workload(spec, tokenizer)
-        return request_spec.prompt, request_spec, PromptSource.BUILTIN.value
+        return spec, None, PromptSource.BUILTIN.value
 
     _fail("either --prompt or --input-tokens is required")
+    raise SystemExit(1)
+
+
+def _resolve_prompt(args: argparse.Namespace) -> tuple[str, RequestSpec, str]:
+    _validate_cli_inputs(args)
+    spec, manual_prompt, source = _build_workload_spec(args)
+    tokenizer = load_tokenizer(args.tokenizer)
+    request_spec = resolve_workload(spec, tokenizer, manual_prompt=manual_prompt)
+    prompt = request_spec.prompt
+    return prompt, request_spec, source
 
 
 def _run_one(args: argparse.Namespace) -> int:
@@ -228,6 +291,122 @@ def _run_one(args: argparse.Namespace) -> int:
     return 0 if run.error is None else 1
 
 
+def _make_production_executor(
+    endpoint: str,
+    model: str,
+    max_output_tokens: int | None,
+    api_key: str | None,
+) -> RequestExecutor:
+    async def execute(
+        request_spec: RequestSpec,
+        *,
+        client: Any,
+        started_at: str,
+        session_start_offset_ns: int,
+        source: str,
+    ) -> Any:
+        from llm_meter.client import Clock
+
+        observations = await stream_completion(
+            endpoint=endpoint,
+            model=model,
+            prompt=request_spec.prompt,
+            max_output_tokens=request_spec.max_output_tokens,
+            api_key=api_key,
+            clock=Clock(),
+            client=client,
+        )
+
+        configuration = RunConfiguration(
+            endpoint=endpoint,
+            model=model,
+            streaming=True,
+            max_output_tokens=request_spec.max_output_tokens,
+        )
+        workload_prov = _build_workload_provenance(request_spec, source)
+
+        return build_run(
+            run_id=str(uuid.uuid4()),
+            started_at=started_at,
+            configuration=configuration,
+            observations=observations,
+            workload=workload_prov,
+        )
+
+    return execute
+
+
+def _validate_batch_inputs(args: argparse.Namespace) -> None:
+    if args.requests <= 0:
+        _fail("--requests must be > 0")
+
+    if args.warmup_requests < 0:
+        _fail("--warmup-requests must be >= 0")
+
+    if args.concurrency <= 0:
+        _fail("--concurrency must be > 0")
+
+    _validate_cli_inputs(args)
+
+
+def _run_batch(args: argparse.Namespace) -> int:
+    _validate_batch_inputs(args)
+
+    spec, manual_prompt, source = _build_workload_spec(args)
+    tokenizer = load_tokenizer(args.tokenizer)
+
+    plan = BenchmarkPlan(
+        warmup_requests=args.warmup_requests,
+        measured_requests=args.requests,
+        concurrency=args.concurrency,
+        workload=spec,
+    )
+
+    api_key = os.environ.get("LLM_METER_API_KEY")
+    executor = _make_production_executor(
+        endpoint=args.endpoint,
+        model=args.model,
+        max_output_tokens=args.max_output_tokens,
+        api_key=api_key,
+    )
+
+    session = asyncio.run(
+        run_session(
+            plan,
+            executor,
+            endpoint=args.endpoint,
+            model=args.model,
+            max_output_tokens=args.max_output_tokens,
+            api_key=api_key,
+            tokenizer=tokenizer,
+            manual_prompt=manual_prompt,
+        )
+    )
+
+    output_path = write_session(session, args.output)
+
+    warmup_count = len(session.warmup_runs)
+    measured_count = len(session.measured_runs)
+    completed_count = sum(
+        1 for r in session.requests if r.run.run_status == "completed"
+    )
+    failed_count = sum(
+        1 for r in session.requests if r.run.run_status == "failed"
+    )
+
+    print(f"session_id:       {session.session_id}")
+    print(f"schema_version:   {session.schema_version}")
+    print(f"status:           {session.status}")
+    print(f"warmup_requests:  {warmup_count}")
+    print(f"measured_requests: {measured_count}")
+    print(f"completed:        {completed_count}")
+    print(f"failed:           {failed_count}")
+    print(f"concurrency:      {session.configuration.concurrency}")
+    print(f"artifact:         {output_path}")
+
+    return 0 if session.status == "completed" else 1
+
+
 def _workload_inspect(args: argparse.Namespace) -> int:
     if args.input_tokens <= 0:
         _fail("--input-tokens must be positive")
@@ -272,6 +451,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run-one":
         return _run_one(args)
+    if args.command == "run-batch":
+        return _run_batch(args)
     if args.command == "workload":
         if args.workload_command == "inspect":
             return _workload_inspect(args)
