@@ -536,6 +536,17 @@ llm-meter does not implement request-rate pacing. All eligible requests are
 submitted as fast as the concurrency limit allows. A future PR may introduce
 rate-controlled arrival.
 
+#### Worker lifecycle
+
+Warmup and measured phases use separate bounded worker pools while sharing
+the same HTTP client/connection pool. Each phase spawns
+`min(concurrency, request_count)` asyncio worker tasks inside a `TaskGroup`.
+Workers pull from a shared `asyncio.Queue` until a sentinel signals
+termination. If a worker raises unexpectedly, the `TaskGroup` cancels all
+sibling workers, the exception propagates cleanly, and the shared HTTP client
+closes normally. The measured phase does not start after a warmup runner-level
+failure.
+
 #### Warmup phase
 
 Warmup requests are **real requests**. They may initialize connection pools,
@@ -630,7 +641,12 @@ Session status semantics:
 | Status | Meaning |
 | --- | --- |
 | `completed` | The runner executed all planned requests. Individual request failures are recorded per-run, not at session level. |
-| `failed` | A runner-level/internal failure prevented completion of the plan. |
+
+A session artifact is written only after the execution plan completes
+successfully at the runner level. If the runner itself encounters an internal
+failure (e.g. executor raises unexpectedly), the exception propagates — no
+partial `BenchmarkSession` is serialized. `SessionStatus.FAILED` is reserved
+for future use but is not currently emitted by the runner.
 
 No API keys, secrets, or prompt text appear in the session artifact. Each
 nested `BenchmarkRun` preserves its own `WorkloadProvenance` and server `Usage`

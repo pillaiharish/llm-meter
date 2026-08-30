@@ -294,7 +294,6 @@ def _run_one(args: argparse.Namespace) -> int:
 def _make_production_executor(
     endpoint: str,
     model: str,
-    max_output_tokens: int | None,
     api_key: str | None,
 ) -> RequestExecutor:
     async def execute(
@@ -366,7 +365,6 @@ def _run_batch(args: argparse.Namespace) -> int:
     executor = _make_production_executor(
         endpoint=args.endpoint,
         model=args.model,
-        max_output_tokens=args.max_output_tokens,
         api_key=api_key,
     )
 
@@ -376,7 +374,6 @@ def _run_batch(args: argparse.Namespace) -> int:
             executor,
             endpoint=args.endpoint,
             model=args.model,
-            max_output_tokens=args.max_output_tokens,
             api_key=api_key,
             tokenizer=tokenizer,
             manual_prompt=manual_prompt,

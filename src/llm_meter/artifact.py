@@ -403,7 +403,7 @@ def _dict_to_session(obj: dict[str, Any]) -> BenchmarkSession:
         session_id=obj["session_id"],
         started_at=obj["started_at"],
         completed_at=obj["completed_at"],
-        status=obj.get("status", "failed"),
+        status=obj.get("status", "completed"),
         configuration=configuration,
         requests=requests,
         provenance=provenance,

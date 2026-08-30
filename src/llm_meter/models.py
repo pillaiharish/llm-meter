@@ -32,7 +32,7 @@ class BenchmarkPhase(StrEnum):
 
 class SessionStatus(StrEnum):
     COMPLETED = "completed"
-    FAILED = "failed"
+    FAILED = "failed"  # reserved: runner-level failures raise; no partial session is serialized
 
 
 class SeedStrategy(StrEnum):

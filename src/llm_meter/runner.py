@@ -141,7 +141,6 @@ async def _worker(
     while True:
         item = await queue.get()
         if item is _SENTINEL:
-            queue.task_done()
             return
 
         idx, work_item = item
@@ -169,17 +168,51 @@ async def _worker(
             session_finish_offset_ns=finish_offset,
             run=run,
         )
-        queue.task_done()
 
 
-async def _drain_queue(
-    queue: asyncio.Queue,
-    workers: list,
-    num_workers: int,
+async def _run_phase(
+    phase_items: list[WorkItem],
+    base_idx: int,
+    results: dict[int, SessionRequest],
+    plan: BenchmarkPlan,
+    tokenizer: Any,
+    manual_prompt: str | None,
+    executor: RequestExecutor,
+    client: httpx.AsyncClient,
+    session_origin_ns: int,
 ) -> None:
+    if not phase_items:
+        return
+
+    queue: asyncio.Queue = asyncio.Queue()
+    for offset, item in enumerate(phase_items):
+        queue.put_nowait((base_idx + offset, item))
+
+    num_workers = min(plan.concurrency, len(phase_items))
     for _ in range(num_workers):
-        await queue.put(_SENTINEL)
-    await asyncio.gather(*workers)
+        queue.put_nowait(_SENTINEL)
+
+    try:
+        async with asyncio.TaskGroup() as tg:
+            for _ in range(num_workers):
+                tg.create_task(
+                    _worker(
+                        queue,
+                        results,
+                        plan,
+                        tokenizer,
+                        manual_prompt,
+                        executor,
+                        client,
+                        session_origin_ns,
+                    )
+                )
+    except BaseExceptionGroup as eg:
+        for exc in eg.exceptions:
+            if isinstance(exc, BaseExceptionGroup):
+                for sub in exc.exceptions:
+                    raise sub from None
+            raise exc from None
 
 
 async def run_session(
@@ -188,7 +221,6 @@ async def run_session(
     *,
     endpoint: str,
     model: str,
-    max_output_tokens: int | None,
     api_key: str | None,
     tokenizer: Any = None,
     manual_prompt: str | None = None,
@@ -212,51 +244,23 @@ async def run_session(
     started_at = datetime.now(UTC).isoformat()
     session_origin_ns = time.perf_counter_ns()
 
-    status = SessionStatus.COMPLETED.value
-    session_requests: list[SessionRequest] = []
+    results: dict[int, SessionRequest] = {}
 
-    try:
-        async with httpx.AsyncClient(limits=limits, headers=headers) as client:
-            results: dict[int, SessionRequest] = {}
-
-            for phase_items in (warmup_items, measured_items):
-                if not phase_items:
-                    continue
-
-                queue: asyncio.Queue = asyncio.Queue()
-                base_idx = len(results)
-                for offset, item in enumerate(phase_items):
-                    queue.put_nowait((base_idx + offset, item))
-
-                num_workers = min(plan.concurrency, len(phase_items))
-                workers = [
-                    asyncio.create_task(
-                        _worker(
-                            queue,
-                            results,
-                            plan,
-                            tokenizer,
-                            manual_prompt,
-                            executor,
-                            client,
-                            session_origin_ns,
-                        )
-                    )
-                    for _ in range(num_workers)
-                ]
-
-                await queue.join()
-                await _drain_queue(queue, workers, num_workers)
-
-            session_requests = [
-                results[i] for i in range(len(work_items)) if i in results
-            ]
-
-    except Exception:
-        status = SessionStatus.FAILED.value
-        raise
+    async with httpx.AsyncClient(limits=limits, headers=headers) as client:
+        await _run_phase(
+            warmup_items, 0, results,
+            plan, tokenizer, manual_prompt, executor, client, session_origin_ns,
+        )
+        await _run_phase(
+            measured_items, len(warmup_items), results,
+            plan, tokenizer, manual_prompt, executor, client, session_origin_ns,
+        )
 
     completed_at = datetime.now(UTC).isoformat()
+
+    session_requests = [
+        results[i] for i in range(len(work_items)) if i in results
+    ]
 
     configuration = SessionConfiguration(
         endpoint=endpoint,
@@ -272,7 +276,7 @@ async def run_session(
         input_tokens_target=plan.workload.input_tokens_target,
         output_tokens_target=plan.workload.output_tokens_target,
         tokenizer_id=plan.workload.tokenizer_id,
-        max_output_tokens=max_output_tokens,
+        max_output_tokens=plan.workload.output_tokens_target,
     )
 
     return BenchmarkSession(
@@ -280,7 +284,7 @@ async def run_session(
         session_id=session_id,
         started_at=started_at,
         completed_at=completed_at,
-        status=status,
+        status=SessionStatus.COMPLETED.value,
         configuration=configuration,
         requests=session_requests,
         provenance=Provenance(llm_meter_version=__version__),

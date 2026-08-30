@@ -65,21 +65,35 @@ def _make_run(
     )
 
 
-class FakeExecutor:
+class SyncExecutor:
+    """Executor using deterministic synchronization primitives instead of sleeps."""
+
     def __init__(
         self,
         fail_ordinals: set[int] | None = None,
-        delay: float = 0,
+        release_immediately: bool = True,
     ) -> None:
         self.fail_ordinals = fail_ordinals or set()
-        self.delay = delay
+        self.release_immediately = release_immediately
         self.active_count = 0
         self.max_active = 0
         self.call_count = 0
-        self.client_used: httpx.AsyncClient | None = None
         self.clients_used: list[httpx.AsyncClient] = []
         self.start_offsets: list[int] = []
         self.finish_order: list[int] = []
+        self._release_event: asyncio.Event | None = None
+        self._started_event: asyncio.Event | None = None
+        self._expected_active: int = 0
+
+    def configure_release(
+        self,
+        release_event: asyncio.Event,
+        started_event: asyncio.Event,
+        expected_active: int,
+    ) -> None:
+        self._release_event = release_event
+        self._started_event = started_event
+        self._expected_active = expected_active
 
     async def __call__(
         self,
@@ -93,16 +107,18 @@ class FakeExecutor:
         self.call_count += 1
         self.active_count += 1
         self.max_active = max(self.max_active, self.active_count)
-        self.client_used = client
         if client not in self.clients_used:
             self.clients_used.append(client)
         self.start_offsets.append(session_start_offset_ns)
 
         ordinal = self.call_count - 1
-        if self.delay > 0:
-            await asyncio.sleep(self.delay)
-        else:
-            await asyncio.sleep(0)
+
+        if not self.release_immediately:
+            assert self._release_event is not None
+            assert self._started_event is not None
+            if self.active_count >= self._expected_active:
+                self._started_event.set()
+            await self._release_event.wait()
 
         self.active_count -= 1
         self.finish_order.append(ordinal)
@@ -113,6 +129,47 @@ class FakeExecutor:
                 run_status=RunStatus.FAILED.value,
             )
         return _make_run(run_id=f"run-{ordinal}")
+
+
+class RaisingExecutor:
+    """Executor that raises on a specific call ordinal."""
+
+    def __init__(self, raise_on_call: int) -> None:
+        self.raise_on_call = raise_on_call
+        self.call_count = 0
+
+    async def __call__(
+        self,
+        request_spec: Any,
+        *,
+        client: httpx.AsyncClient,
+        started_at: str,
+        session_start_offset_ns: int,
+        source: str,
+    ) -> BenchmarkRun:
+        self.call_count += 1
+        if self.call_count == self.raise_on_call:
+            raise RuntimeError(f"injected failure on call {self.call_count}")
+        await asyncio.sleep(0)
+        return _make_run(run_id=f"run-{self.call_count - 1}")
+
+
+class RaisingOnResolveExecutor:
+    """Executor that always raises (simulates workload resolution failure)."""
+
+    call_count = 0
+
+    async def __call__(
+        self,
+        request_spec: Any,
+        *,
+        client: httpx.AsyncClient,
+        started_at: str,
+        session_start_offset_ns: int,
+        source: str,
+    ) -> BenchmarkRun:
+        self.call_count += 1
+        raise RuntimeError("workload resolution failure")
 
 
 def _make_plan(
@@ -147,7 +204,6 @@ def _run(plan: BenchmarkPlan, executor: RequestExecutor, **kwargs: Any) -> Any:
             executor,
             endpoint="http://localhost:8000/v1",
             model="test-model",
-            max_output_tokens=kwargs.get("max_output_tokens", 64),
             api_key=None,
             tokenizer=tok,
             manual_prompt=kwargs.get("manual_prompt"),
@@ -161,29 +217,75 @@ def _fake_tokenizer():
     return FakeTokenizer(tokenizer_id="fake")
 
 
+# ---------------------------------------------------------------------------
+# Concurrency tests — deterministic, no wall-clock delays
+# ---------------------------------------------------------------------------
+
+
 def test_concurrency_1_runs_serially() -> None:
-    executor = FakeExecutor(delay=0.01)
+    executor = SyncExecutor()
     plan = _make_plan(measured=4, concurrency=1)
     _run(plan, executor)
     assert executor.max_active == 1
 
 
 def test_max_inflight_never_exceeds_concurrency() -> None:
-    executor = FakeExecutor(delay=0.005)
-    plan = _make_plan(measured=10, concurrency=3)
-    _run(plan, executor)
-    assert executor.max_active <= 3
+    async def _test() -> None:
+        executor = SyncExecutor(release_immediately=False)
+        plan = _make_plan(measured=6, concurrency=3)
+
+        release_event = asyncio.Event()
+        started_event = asyncio.Event()
+        executor.configure_release(release_event, started_event, 3)
+
+        task = asyncio.create_task(
+            run_session(
+                plan, executor,
+                endpoint="http://localhost:8000/v1",
+                model="test-model",
+                api_key=None,
+                tokenizer=_fake_tokenizer(),
+            )
+        )
+        await asyncio.wait_for(started_event.wait(), timeout=5)
+        assert executor.active_count <= 3
+        assert executor.max_active <= 3
+        release_event.set()
+        await asyncio.wait_for(task, timeout=5)
+        assert executor.max_active <= 3
+
+    asyncio.run(_test())
 
 
 def test_concurrency_reaches_requested_value() -> None:
-    executor = FakeExecutor(delay=0.02)
-    plan = _make_plan(measured=8, concurrency=4)
-    _run(plan, executor)
-    assert executor.max_active == 4
+    async def _test() -> None:
+        executor = SyncExecutor(release_immediately=False)
+        plan = _make_plan(measured=8, concurrency=4)
+
+        release_event = asyncio.Event()
+        started_event = asyncio.Event()
+        executor.configure_release(release_event, started_event, 4)
+
+        task = asyncio.create_task(
+            run_session(
+                plan, executor,
+                endpoint="http://localhost:8000/v1",
+                model="test-model",
+                api_key=None,
+                tokenizer=_fake_tokenizer(),
+            )
+        )
+        await asyncio.wait_for(started_event.wait(), timeout=5)
+        assert executor.active_count == 4
+        assert executor.max_active == 4
+        release_event.set()
+        await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(_test())
 
 
 def test_warmup_completes_before_measured() -> None:
-    executor = FakeExecutor(delay=0.005)
+    executor = SyncExecutor()
     plan = _make_plan(warmup=3, measured=5, concurrency=2)
     session = _run(plan, executor)
 
@@ -199,22 +301,27 @@ def test_warmup_completes_before_measured() -> None:
             assert wf <= ms, "measured request started before warmup finished"
 
 
+# ---------------------------------------------------------------------------
+# Count and label tests
+# ---------------------------------------------------------------------------
+
+
 def test_warmup_request_count_exact() -> None:
-    executor = FakeExecutor()
+    executor = SyncExecutor()
     plan = _make_plan(warmup=4, measured=10, concurrency=2)
     session = _run(plan, executor)
     assert len(session.warmup_runs) == 4
 
 
 def test_measured_request_count_exact() -> None:
-    executor = FakeExecutor()
+    executor = SyncExecutor()
     plan = _make_plan(warmup=4, measured=10, concurrency=2)
     session = _run(plan, executor)
     assert len(session.measured_runs) == 10
 
 
 def test_warmup_runs_labeled_warmup() -> None:
-    executor = FakeExecutor()
+    executor = SyncExecutor()
     plan = _make_plan(warmup=3, measured=5, concurrency=1)
     session = _run(plan, executor)
     for r in session.warmup_runs:
@@ -222,15 +329,20 @@ def test_warmup_runs_labeled_warmup() -> None:
 
 
 def test_measured_runs_labeled_measured() -> None:
-    executor = FakeExecutor()
+    executor = SyncExecutor()
     plan = _make_plan(warmup=3, measured=5, concurrency=1)
     session = _run(plan, executor)
     for r in session.measured_runs:
         assert r.phase == BenchmarkPhase.MEASURED.value
 
 
+# ---------------------------------------------------------------------------
+# Request-level failure tests
+# ---------------------------------------------------------------------------
+
+
 def test_request_failures_do_not_abort_remaining() -> None:
-    executor = FakeExecutor(fail_ordinals={1, 3})
+    executor = SyncExecutor(fail_ordinals={1, 3})
     plan = _make_plan(measured=6, concurrency=1)
     session = _run(plan, executor)
     assert len(session.requests) == 6
@@ -238,14 +350,14 @@ def test_request_failures_do_not_abort_remaining() -> None:
 
 
 def test_no_automatic_retry() -> None:
-    executor = FakeExecutor(fail_ordinals={2})
+    executor = SyncExecutor(fail_ordinals={2})
     plan = _make_plan(measured=5, concurrency=1)
     _run(plan, executor)
     assert executor.call_count == 5
 
 
 def test_failed_request_still_counts_as_attempt() -> None:
-    executor = FakeExecutor(fail_ordinals={0, 2})
+    executor = SyncExecutor(fail_ordinals={0, 2})
     plan = _make_plan(measured=5, concurrency=1)
     session = _run(plan, executor)
     failed = [r for r in session.requests if r.run.run_status == "failed"]
@@ -254,10 +366,15 @@ def test_failed_request_still_counts_as_attempt() -> None:
 
 
 def test_session_completed_despite_request_failures() -> None:
-    executor = FakeExecutor(fail_ordinals={1, 3})
+    executor = SyncExecutor(fail_ordinals={1, 3})
     plan = _make_plan(measured=6, concurrency=2)
     session = _run(plan, executor)
     assert session.status == "completed"
+
+
+# ---------------------------------------------------------------------------
+# Validation tests
+# ---------------------------------------------------------------------------
 
 
 def test_invalid_concurrency_rejected() -> None:
@@ -284,19 +401,29 @@ def test_negative_warmup_rejected() -> None:
         plan.validate()
 
 
+# ---------------------------------------------------------------------------
+# Shared client tests
+# ---------------------------------------------------------------------------
+
+
 def test_shared_client_reused_across_warmup_and_measured() -> None:
-    executor = FakeExecutor(delay=0.005)
+    executor = SyncExecutor()
     plan = _make_plan(warmup=3, measured=5, concurrency=2)
     _run(plan, executor)
     assert len(executor.clients_used) == 1
 
 
 def test_concurrency_greater_than_requests_is_valid() -> None:
-    executor = FakeExecutor()
+    executor = SyncExecutor()
     plan = _make_plan(measured=4, concurrency=8)
     session = _run(plan, executor)
     assert len(session.requests) == 4
     assert executor.max_active <= 4
+
+
+# ---------------------------------------------------------------------------
+# Seed strategy tests
+# ---------------------------------------------------------------------------
 
 
 def test_builtin_per_request_seeds_follow_strategy() -> None:
@@ -379,10 +506,15 @@ def test_manual_prompts_preserve_same_fingerprint() -> None:
     assert all(s == shas[0] for s in shas)
 
 
+# ---------------------------------------------------------------------------
+# Provenance / usage / artifact tests
+# ---------------------------------------------------------------------------
+
+
 def test_prompts_absent_from_serialized_session() -> None:
     from llm_meter.artifact import session_to_json
 
-    executor = FakeExecutor()
+    executor = SyncExecutor()
     plan = _make_plan(warmup=1, measured=3, concurrency=1)
     session = _run(plan, executor)
     json_str = session_to_json(session)
@@ -401,7 +533,7 @@ def _check_no_prompt_in_runs(data: dict) -> bool:
 
 
 def test_each_request_retains_workload_provenance() -> None:
-    executor = FakeExecutor()
+    executor = SyncExecutor()
     plan = _make_plan(warmup=2, measured=4, concurrency=1)
     session = _run(plan, executor)
     for r in session.requests:
@@ -410,7 +542,7 @@ def test_each_request_retains_workload_provenance() -> None:
 
 
 def test_each_request_retains_own_server_usage() -> None:
-    executor = FakeExecutor()
+    executor = SyncExecutor()
     plan = _make_plan(measured=4, concurrency=2)
     session = _run(plan, executor)
     for r in session.requests:
@@ -420,7 +552,7 @@ def test_each_request_retains_own_server_usage() -> None:
 
 
 def test_session_offsets_non_negative_and_ordered() -> None:
-    executor = FakeExecutor(delay=0.001)
+    executor = SyncExecutor()
     plan = _make_plan(warmup=2, measured=4, concurrency=2)
     session = _run(plan, executor)
     for r in session.requests:
@@ -431,7 +563,7 @@ def test_session_offsets_non_negative_and_ordered() -> None:
 def test_session_json_round_trip() -> None:
     from llm_meter.artifact import session_from_json, session_to_json
 
-    executor = FakeExecutor()
+    executor = SyncExecutor()
     plan = _make_plan(warmup=2, measured=4, concurrency=2)
     session = _run(plan, executor)
     json_str = session_to_json(session)
@@ -455,17 +587,155 @@ def test_benchmark_run_json_backward_compatible() -> None:
     assert restored.run_id == "test-run"
 
 
-def test_runner_tests_use_no_real_network() -> None:
-    assert True
+# ---------------------------------------------------------------------------
+# Runner-exception tests — no deadlock, clean propagation
+# ---------------------------------------------------------------------------
 
 
-def test_no_gpu_dependency_required() -> None:
-    import importlib
+def test_executor_raises_concurrency_1_does_not_deadlock() -> None:
+    executor = RaisingExecutor(raise_on_call=1)
+    plan = _make_plan(measured=4, concurrency=1)
+    with pytest.raises(RuntimeError, match="injected failure"):
+        asyncio.run(
+            asyncio.wait_for(
+                _run_async(plan, executor),
+                timeout=10,
+            )
+        )
 
-    gpu_modules = ["torch", "pynvml", "dcgm"]
-    for mod in gpu_modules:
-        try:
-            importlib.import_module(mod)
-            pytest.fail(f"GPU dependency {mod} found")
-        except ImportError:
-            pass
+
+async def _run_async(plan: BenchmarkPlan, executor: RequestExecutor) -> Any:
+    return await run_session(
+        plan, executor,
+        endpoint="http://localhost:8000/v1",
+        model="test-model",
+        api_key=None,
+        tokenizer=_fake_tokenizer(),
+    )
+
+
+def test_executor_raises_concurrency_1_raises_promptly() -> None:
+    executor = RaisingExecutor(raise_on_call=1)
+    plan = _make_plan(measured=4, concurrency=1)
+    with pytest.raises(RuntimeError, match="injected failure"):
+        asyncio.run(
+            asyncio.wait_for(
+                _run_async(plan, executor),
+                timeout=10,
+            )
+        )
+
+
+def test_executor_raises_concurrency_gt_1_raises_promptly() -> None:
+    executor = RaisingExecutor(raise_on_call=2)
+    plan = _make_plan(measured=6, concurrency=3)
+    with pytest.raises(RuntimeError, match="injected failure"):
+        asyncio.run(
+            asyncio.wait_for(
+                _run_async(plan, executor),
+                timeout=10,
+            )
+        )
+
+
+def test_executor_raises_concurrency_1_more_requests_remain() -> None:
+    executor = RaisingExecutor(raise_on_call=2)
+    plan = _make_plan(measured=8, concurrency=1)
+    with pytest.raises(RuntimeError, match="injected failure"):
+        asyncio.run(
+            asyncio.wait_for(
+                _run_async(plan, executor),
+                timeout=10,
+            )
+        )
+
+
+def test_warmup_runner_failure_prevents_measured_phase() -> None:
+    executor = RaisingExecutor(raise_on_call=1)
+    plan = _make_plan(warmup=3, measured=5, concurrency=1)
+    with pytest.raises(RuntimeError, match="injected failure"):
+        asyncio.run(
+            asyncio.wait_for(
+                _run_async(plan, executor),
+                timeout=10,
+            )
+        )
+    assert executor.call_count < plan.total_requests
+
+
+def test_warmup_runner_failure_prevents_measured_phase_concurrency_gt_1() -> None:
+    executor = RaisingExecutor(raise_on_call=2)
+    plan = _make_plan(warmup=4, measured=6, concurrency=3)
+    with pytest.raises(RuntimeError, match="injected failure"):
+        asyncio.run(
+            asyncio.wait_for(
+                _run_async(plan, executor),
+                timeout=10,
+            )
+        )
+    assert executor.call_count < plan.total_requests
+
+
+def test_request_level_failure_does_not_abort_session() -> None:
+    executor = SyncExecutor(fail_ordinals={0, 1, 2})
+    plan = _make_plan(warmup=2, measured=5, concurrency=2)
+    session = _run(plan, executor)
+    assert session.status == "completed"
+    assert len(session.requests) == 7
+
+
+def test_workload_resolution_failure_raises() -> None:
+    executor = RaisingOnResolveExecutor()
+    plan = _make_plan(measured=3, concurrency=1)
+    with pytest.raises(RuntimeError, match="workload resolution failure"):
+        asyncio.run(
+            asyncio.wait_for(
+                _run_async(plan, executor),
+                timeout=10,
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# Max-output provenance tests
+# ---------------------------------------------------------------------------
+
+
+def test_max_output_tokens_derived_from_workload_plan() -> None:
+    executor = SyncExecutor()
+    plan = _make_plan(measured=3, concurrency=1, output_tokens=128)
+    session = _run(plan, executor)
+    assert session.configuration.max_output_tokens == 128
+    assert session.configuration.output_tokens_target == 128
+
+
+def test_manual_workload_max_output_can_be_none() -> None:
+    executor = SyncExecutor()
+    plan = _make_plan(
+        measured=3,
+        concurrency=1,
+        prompt_source=PromptSource.MANUAL.value,
+        input_tokens=None,
+        output_tokens=None,
+    )
+    session = _run(plan, executor, manual_prompt="hello")
+    assert session.configuration.max_output_tokens is None
+    assert session.configuration.output_tokens_target is None
+
+
+# ---------------------------------------------------------------------------
+# GPU dependency test — verify pyproject.toml, not runtime imports
+# ---------------------------------------------------------------------------
+
+
+def test_no_gpu_dependency_in_pyproject() -> None:
+    import tomllib
+
+    with open("pyproject.toml", "rb") as f:
+        data = tomllib.load(f)
+
+    deps = data.get("project", {}).get("dependencies", [])
+    gpu_deps = {"torch", "pynvml", "nvidia-ml-py", "dcgm", "cupy"}
+    for dep in deps:
+        dep_name = dep.split(">")[0].split("<")[0].split("=")[0].strip().lower()
+        assert dep_name not in gpu_deps, f"GPU dependency found: {dep}"

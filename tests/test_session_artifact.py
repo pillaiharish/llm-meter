@@ -110,7 +110,6 @@ def _make_session() -> BenchmarkSession:
             executor,
             endpoint="http://localhost:8000/v1",
             model="test-model",
-            max_output_tokens=64,
             api_key=None,
             tokenizer=tok,
         )
