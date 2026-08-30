@@ -85,12 +85,21 @@ def sanitize_endpoint(url: str) -> str:
 
 _URL_PATTERN = re.compile(r"https?://\S+")
 
+_BEARER_PATTERN = re.compile(
+    r"(Authorization\s*:\s*)([^\s]+(?:\s+[^\s]+)*)",
+    re.IGNORECASE,
+)
+
 
 def sanitize_text(text: str) -> str:
-    def _replace(match: re.Match[str]) -> str:
+    def _replace_url(match: re.Match[str]) -> str:
         return sanitize_endpoint(match.group(0))
 
-    return _URL_PATTERN.sub(_replace, text)
+    def _replace_bearer(match: re.Match[str]) -> str:
+        return f"{match.group(1)}***REDACTED***"
+
+    text = _URL_PATTERN.sub(_replace_url, text)
+    return _BEARER_PATTERN.sub(_replace_bearer, text)
 
 
 def build_run(

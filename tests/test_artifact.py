@@ -314,6 +314,39 @@ def test_error_message_url_redacted() -> None:
     assert "Connection failed" in json_str
 
 
+def test_authorization_credential_redacted() -> None:
+    configuration = RunConfiguration(
+        endpoint="http://localhost:8000/v1",
+        model="test-model",
+        streaming=True,
+    )
+    observations = RawObservations(
+        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
+        stream_events=[],
+        error=ErrorObservation(
+            offset_ns=10_000_000,
+            category="http_error",
+            status=401,
+            exception_type="HTTPStatusError",
+            message="request failed: Authorization: Bearer sk-super-secret",
+        ),
+        usage=Usage(source=TokenCountSource.UNKNOWN),
+    )
+    run = build_run(
+        run_id="bearer-redact-test",
+        started_at="2025-01-01T00:00:00Z",
+        configuration=configuration,
+        observations=observations,
+    )
+
+    json_str = to_json(run)
+    assert "sk-super-secret" not in json_str
+    assert "Bearer" not in json_str
+    assert "Authorization" in json_str
+    assert "***REDACTED***" in json_str
+    assert "request failed" in json_str
+
+
 def test_run_status_in_artifact() -> None:
     run = _make_run()
     data = json.loads(to_json(run))
