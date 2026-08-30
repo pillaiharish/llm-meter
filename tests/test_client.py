@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 
 from llm_meter.client import FakeClock, stream_completion
 from llm_meter.models import RunStatus, TokenCountSource
@@ -618,3 +619,54 @@ def test_run_status_failed_on_unexpected_eof() -> None:
         observations=result,
     )
     assert run.run_status == RunStatus.FAILED.value
+
+
+def test_externally_supplied_client_not_closed() -> None:
+    transport = _make_sse_response([
+        _role_delta(),
+        _content_delta("Hello"),
+        _finish("stop"),
+        "[DONE]",
+    ])
+
+    import asyncio as _asyncio
+
+    external_client = httpx.AsyncClient(transport=transport)
+    try:
+        result = asyncio_run(
+            stream_completion(
+                endpoint="http://localhost:8000/v1",
+                model="test-model",
+                prompt="hi",
+                client=external_client,
+            )
+        )
+        assert result.error is None
+        assert result.completion is not None
+        assert external_client.is_closed is False
+    finally:
+        loop = _asyncio.new_event_loop()
+        loop.run_until_complete(external_client.aclose())
+        loop.close()
+
+
+def test_transport_and_client_mutually_exclusive() -> None:
+    transport = _make_sse_response(["[DONE]"])
+    external_client = httpx.AsyncClient(transport=transport)
+    try:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            asyncio_run(
+                stream_completion(
+                    endpoint="http://localhost:8000/v1",
+                    model="test-model",
+                    prompt="hi",
+                    transport=transport,
+                    client=external_client,
+                )
+            )
+    finally:
+        import asyncio as _asyncio
+
+        loop = _asyncio.new_event_loop()
+        loop.run_until_complete(external_client.aclose())
+        loop.close()

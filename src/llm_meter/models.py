@@ -25,6 +25,20 @@ class RunStatus(StrEnum):
     FAILED = "failed"
 
 
+class BenchmarkPhase(StrEnum):
+    WARMUP = "warmup"
+    MEASURED = "measured"
+
+
+class SessionStatus(StrEnum):
+    COMPLETED = "completed"
+    FAILED = "failed"  # reserved: runner-level failures raise; no partial session is serialized
+
+
+class SeedStrategy(StrEnum):
+    BASE_PLUS_GLOBAL_ORDINAL = "base_plus_global_ordinal"
+
+
 @dataclass
 class RequestStart:
     offset_ns: int
@@ -133,6 +147,53 @@ class RawObservations:
     completion: Completion | None = None
     error: ErrorObservation | None = None
     usage: Usage = field(default_factory=Usage)
+
+
+@dataclass
+class SessionConfiguration:
+    endpoint: str
+    model: str
+    warmup_requests: int
+    measured_requests: int
+    concurrency: int
+    seed: int
+    seed_strategy: str
+    max_connections: int
+    max_keepalive_connections: int
+    prompt_source: str
+    input_tokens_target: int | None
+    output_tokens_target: int | None
+    tokenizer_id: str | None
+    max_output_tokens: int | None = None
+
+
+@dataclass
+class SessionRequest:
+    phase: str
+    ordinal: int
+    session_start_offset_ns: int
+    session_finish_offset_ns: int
+    run: BenchmarkRun
+
+
+@dataclass
+class BenchmarkSession:
+    schema_version: str
+    session_id: str
+    started_at: str
+    completed_at: str
+    status: str
+    configuration: SessionConfiguration
+    requests: list[SessionRequest]
+    provenance: Provenance
+
+    @property
+    def warmup_runs(self) -> list[SessionRequest]:
+        return [r for r in self.requests if r.phase == BenchmarkPhase.WARMUP.value]
+
+    @property
+    def measured_runs(self) -> list[SessionRequest]:
+        return [r for r in self.requests if r.phase == BenchmarkPhase.MEASURED.value]
 
 
 def dataclass_to_dict(obj: Any) -> Any:

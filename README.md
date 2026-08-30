@@ -320,10 +320,18 @@ The first engine-specific integration can target vLLM benchmarking while retaini
   and a SHA-256 fingerprint of the prompt actually sent.
 - **fingerprint prompts** — the exact prompt text actually sent is hashed
   (SHA-256) after final workload resolution, not before.
+- **execute warmup and measured phases** — a benchmark session runs warmup
+  requests followed by measured requests at a fixed concurrency, preserving
+  every individual `BenchmarkRun`.
+- **control concurrency** — a worker-pool limits the maximum number of
+  simultaneously in-flight requests. Concurrency is not QPS, request rate, or
+  batch size.
+- **serialize a `BenchmarkSession` artifact** — the session artifact contains
+  the execution plan, all per-request `BenchmarkRun` objects, and orchestration
+  timing offsets.
 
-This is an experimental single-request capability. It is not the full V1
-benchmark. Concurrency, sweeps, warmup, percentiles, and aggregate throughput
-are not yet implemented.
+This is an experimental multi-request capability. Percentile aggregation,
+throughput summaries, and GPU telemetry are not yet implemented.
 
 ### Usage
 
@@ -482,6 +490,167 @@ All timestamps are **integer nanoseconds** relative to an explicit run origin.
 Absent data is represented as `null` rather than fabricated. No API keys or
 secrets appear in the artifact. Prompt text is **not** persisted in the
 artifact — only its SHA-256 fingerprint and character count.
+
+### `run-batch` — multi-request benchmark
+
+Execute warmup requests followed by measured requests at a fixed concurrency:
+
+```bash
+llm-meter run-batch \
+  --endpoint http://localhost:8000/v1 \
+  --model some-model \
+  --tokenizer Qwen/Qwen3-8B \
+  --input-tokens 512 \
+  --max-output-tokens 128 \
+  --warmup-requests 4 \
+  --requests 20 \
+  --concurrency 4 \
+  --seed 42 \
+  --output session.json
+```
+
+Manual prompt mode:
+
+```bash
+llm-meter run-batch \
+  --endpoint http://localhost:8000/v1 \
+  --model some-model \
+  --prompt "Explain dynamic batching." \
+  --max-output-tokens 128 \
+  --warmup-requests 2 \
+  --requests 10 \
+  --concurrency 2 \
+  --output session.json
+```
+
+#### Concurrency is not QPS, request rate, or batch size
+
+**Concurrency** is the maximum number of requests simultaneously in flight.
+It does not mean:
+
+- **QPS / request rate** — how many requests per second to submit
+- **batch size** — the serving engine's internal batch composition
+- **arrival distribution** — a stochastic load model
+
+llm-meter does not implement request-rate pacing. All eligible requests are
+submitted as fast as the concurrency limit allows. A future PR may introduce
+rate-controlled arrival.
+
+#### Worker lifecycle
+
+Warmup and measured phases use separate bounded worker pools while sharing
+the same HTTP client/connection pool. Each phase spawns
+`min(concurrency, request_count)` asyncio worker tasks inside a `TaskGroup`.
+Workers pull from a shared `asyncio.Queue` until a sentinel signals
+termination. If a worker raises unexpectedly, the `TaskGroup` cancels all
+sibling workers, the exception propagates cleanly, and the shared HTTP client
+closes normally. The measured phase does not start after a warmup runner-level
+failure.
+
+#### Warmup phase
+
+Warmup requests are **real requests**. They may initialize connection pools,
+serving-runtime state, kernels, caches, and memory allocations.
+
+Warmup request metrics are **never** treated as measured benchmark samples.
+Every request carries an explicit `phase` field (`warmup` or `measured`), and
+the session artifact provides separated `warmup_runs` / `measured_runs`
+collections.
+
+All warmup requests complete before any measured request begins. There is no
+overlap between phases.
+
+#### Per-request seed strategy (builtin)
+
+For builtin generated workloads, each request gets a deterministic per-request
+seed:
+
+```
+request_seed = base_seed + global_request_ordinal
+```
+
+where the global ordinal spans both phases:
+
+```
+warmup #0        → seed + 0
+warmup #1        → seed + 1
+...
+measured #0      → seed + warmup_requests
+measured #1      → seed + warmup_requests + 1
+```
+
+This means measured prompts do not intentionally reuse warmup prompt seeds.
+The final `prompt_sha256` is authoritative — the seed strategy does not
+guarantee prompt uniqueness, but makes it deterministic.
+
+The session records the seed strategy as `base_plus_global_ordinal` in
+`configuration.seed_strategy`.
+
+#### Manual prompt caveat
+
+For manual prompt workloads, the same prompt text is reused across all
+requests (warmup and measured). A repeated manual prompt may interact with
+server-side prefix caching, which can affect observed latency. This is
+documented behavior, not a bug — the artifact records the prompt fingerprint so
+the condition is reproducible.
+
+### BenchmarkSession artifact
+
+The session artifact is a JSON object with schema version `1`. It contains:
+
+```json
+{
+  "schema_version": "1",
+  "session_id": "uuid",
+  "started_at": "2025-01-01T00:00:00+00:00",
+  "completed_at": "2025-01-01T00:01:00+00:00",
+  "status": "completed",
+  "configuration": {
+    "endpoint": "http://localhost:8000/v1",
+    "model": "some-model",
+    "warmup_requests": 4,
+    "measured_requests": 20,
+    "concurrency": 4,
+    "seed": 42,
+    "seed_strategy": "base_plus_global_ordinal",
+    "max_connections": 4,
+    "max_keepalive_connections": 4,
+    "prompt_source": "builtin",
+    "input_tokens_target": 512,
+    "output_tokens_target": 128,
+    "tokenizer_id": "Qwen/Qwen3-8B",
+    "max_output_tokens": 128
+  },
+  "requests": [
+    {
+      "phase": "warmup",
+      "ordinal": 0,
+      "session_start_offset_ns": 1000,
+      "session_finish_offset_ns": 50000000,
+      "run": { "...": "BenchmarkRun" }
+    }
+  ],
+  "provenance": {
+    "llm_meter_version": "0.1.0.dev0"
+  }
+}
+```
+
+Session status semantics:
+
+| Status | Meaning |
+| --- | --- |
+| `completed` | The runner executed all planned requests. Individual request failures are recorded per-run, not at session level. |
+
+A session artifact is written only after the execution plan completes
+successfully at the runner level. If the runner itself encounters an internal
+failure (e.g. executor raises unexpectedly), the exception propagates — no
+partial `BenchmarkSession` is serialized. `SessionStatus.FAILED` is reserved
+for future use but is not currently emitted by the runner.
+
+No API keys, secrets, or prompt text appear in the session artifact. Each
+nested `BenchmarkRun` preserves its own `WorkloadProvenance` and server `Usage`
+independently.
 
 ---
 
@@ -680,21 +849,33 @@ Apache License 2.0. See [LICENSE](LICENSE).
 
 ## Status
 
-`llm-meter` is under active development. The experimental `run-one` command can
-perform a single streaming request and produce a `BenchmarkRun` JSON artifact
-with deterministic, tokenizer-aware workload specification and prompt
-fingerprinting. The `workload inspect` command resolves a workload
-specification without making any network request.
+`llm-meter` is under active development. The experimental commands `run-one`
+and `run-batch` can perform single-request and multi-request benchmarks,
+producing `BenchmarkRun` and `BenchmarkSession` JSON artifacts with
+deterministic, tokenizer-aware workload specification and prompt fingerprinting.
+The `workload inspect` command resolves a workload specification without making
+any network request.
+
+Implemented:
+
+- single-request observation
+- workload specification
+- warmup phase
+- measured phase
+- controlled concurrency
+- per-request `BenchmarkRun` preservation
+- `BenchmarkSession` artifact
 
 Still planned:
 
-- concurrency
-- warmup / measured phases
-- percentiles (p50, p90, p95, p99)
+- percentile aggregation (p50, p90, p95, p99)
 - aggregate throughput
+- error-rate summary
+- environment/GPU provenance
+- CSV export
+- run-to-run comparison
 - GPU telemetry
 - engine-specific adapters
-- CSV export
 
 V1 is being designed.
 

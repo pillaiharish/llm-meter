@@ -96,35 +96,14 @@ def _extract_usage(usage_data: dict[str, Any]) -> Usage:
     )
 
 
-async def stream_completion(
+async def _do_stream(
+    client: httpx.AsyncClient,
     *,
-    endpoint: str,
-    model: str,
-    prompt: str,
-    max_output_tokens: int | None = None,
-    api_key: str | None = None,
-    clock: Clock | None = None,
-    transport: httpx.AsyncBaseTransport | None = None,
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    clock: Clock,
 ) -> RawObservations:
-    if clock is None:
-        clock = Clock()
-
-    key = api_key or os.environ.get("LLM_METER_API_KEY")
-    headers: dict[str, str] = {"Content-Type": "application/json"}
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-
-    base = endpoint.rstrip("/")
-    url = f"{base}/chat/completions"
-
-    body: dict[str, Any] = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": True,
-    }
-    if max_output_tokens is not None:
-        body["max_tokens"] = max_output_tokens
-
     stream_events: list[StreamEvent] = []
     completion: Completion | None = None
     response_established: ResponseEstablished | None = None
@@ -132,37 +111,54 @@ async def stream_completion(
     usage = Usage(source=TokenCountSource.UNKNOWN)
     sequence = 0
 
-    client_kwargs: dict[str, Any] = {}
-    if transport is not None:
-        client_kwargs["transport"] = transport
+    clock.start()
+    request_start = RequestStart(
+        offset_ns=0,
+        wall_clock_utc=Clock.wall_clock_utc(),
+    )
 
     try:
-        async with httpx.AsyncClient(**client_kwargs) as client:
-            clock.start()
-            request_start = RequestStart(
-                offset_ns=0,
-                wall_clock_utc=Clock.wall_clock_utc(),
+        async with client.stream(
+            "POST",
+            url,
+            json=body,
+            headers=headers,
+            timeout=httpx.Timeout(60.0, connect=10.0),
+        ) as response:
+            response_established = ResponseEstablished(
+                offset_ns=clock.now_offset_ns(),
+                status_code=response.status_code,
+                content_type=response.headers.get("content-type"),
             )
 
-            async with client.stream(
-                "POST",
-                url,
-                json=body,
-                headers=headers,
-                timeout=httpx.Timeout(60.0, connect=10.0),
-            ) as response:
-                response_established = ResponseEstablished(
+            if response.status_code >= 400:
+                error = ErrorObservation(
                     offset_ns=clock.now_offset_ns(),
-                    status_code=response.status_code,
-                    content_type=response.headers.get("content-type"),
+                    category="http_error",
+                    status=response.status_code,
+                    message=f"HTTP {response.status_code}",
+                )
+                return RawObservations(
+                    request_start=request_start,
+                    stream_events=stream_events,
+                    response_established=response_established,
+                    completion=completion,
+                    error=error,
+                    usage=usage,
                 )
 
-                if response.status_code >= 400:
+            async for line in response.aiter_lines():
+                if not line.strip():
+                    continue
+                receive_offset_ns = clock.now_offset_ns()
+                try:
+                    parsed = parse_sse_data(line)
+                except SSEParseError as exc:
                     error = ErrorObservation(
-                        offset_ns=clock.now_offset_ns(),
-                        category="http_error",
-                        status=response.status_code,
-                        message=f"HTTP {response.status_code}",
+                        offset_ns=receive_offset_ns,
+                        category="sse_parse",
+                        exception_type=type(exc).__name__,
+                        message=str(exc),
                     )
                     return RawObservations(
                         request_start=request_start,
@@ -173,60 +169,38 @@ async def stream_completion(
                         usage=usage,
                     )
 
-                async for line in response.aiter_lines():
-                    if not line.strip():
-                        continue
-                    receive_offset_ns = clock.now_offset_ns()
-                    try:
-                        parsed = parse_sse_data(line)
-                    except SSEParseError as exc:
-                        error = ErrorObservation(
-                            offset_ns=receive_offset_ns,
-                            category="sse_parse",
-                            exception_type=type(exc).__name__,
-                            message=str(exc),
-                        )
-                        return RawObservations(
-                            request_start=request_start,
-                            stream_events=stream_events,
-                            response_established=response_established,
-                            completion=completion,
-                            error=error,
-                            usage=usage,
-                        )
-
-                    if parsed is DONE:
-                        completion = Completion(
-                            offset_ns=receive_offset_ns,
-                            wall_clock_utc=Clock.wall_clock_utc(),
-                        )
-                        break
-                    if not parsed:
-                        continue
-
-                    event_type, text_delta, finish_reason, event_usage = _classify_event(parsed)
-
-                    if event_usage is not None:
-                        usage = _extract_usage(event_usage)
-
-                    stream_events.append(
-                        StreamEvent(
-                            sequence=sequence,
-                            offset_ns=receive_offset_ns,
-                            event_type=event_type,
-                            text_delta=text_delta,
-                            finish_reason=finish_reason,
-                            usage=event_usage,
-                        )
+                if parsed is DONE:
+                    completion = Completion(
+                        offset_ns=receive_offset_ns,
+                        wall_clock_utc=Clock.wall_clock_utc(),
                     )
-                    sequence += 1
+                    break
+                if not parsed:
+                    continue
 
-                if completion is None:
-                    error = ErrorObservation(
-                        offset_ns=clock.now_offset_ns(),
-                        category="stream_unexpected_end",
-                        message="stream ended without [DONE]",
+                event_type, text_delta, finish_reason, event_usage = _classify_event(parsed)
+
+                if event_usage is not None:
+                    usage = _extract_usage(event_usage)
+
+                stream_events.append(
+                    StreamEvent(
+                        sequence=sequence,
+                        offset_ns=receive_offset_ns,
+                        event_type=event_type,
+                        text_delta=text_delta,
+                        finish_reason=finish_reason,
+                        usage=event_usage,
                     )
+                )
+                sequence += 1
+
+            if completion is None:
+                error = ErrorObservation(
+                    offset_ns=clock.now_offset_ns(),
+                    category="stream_unexpected_end",
+                    message="stream ended without [DONE]",
+                )
 
     except httpx.TransportError as exc:
         error = ErrorObservation(
@@ -251,3 +225,52 @@ async def stream_completion(
         error=error,
         usage=usage,
     )
+
+
+async def stream_completion(
+    *,
+    endpoint: str,
+    model: str,
+    prompt: str,
+    max_output_tokens: int | None = None,
+    api_key: str | None = None,
+    clock: Clock | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> RawObservations:
+    if transport is not None and client is not None:
+        raise ValueError(
+            "transport and client are mutually exclusive; "
+            "supply an externally managed client OR a transport, not both"
+        )
+
+    if clock is None:
+        clock = Clock()
+
+    key = api_key or os.environ.get("LLM_METER_API_KEY")
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+
+    base = endpoint.rstrip("/")
+    url = f"{base}/chat/completions"
+
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": True,
+    }
+    if max_output_tokens is not None:
+        body["max_tokens"] = max_output_tokens
+
+    if client is not None:
+        return await _do_stream(client, url=url, headers=headers, body=body, clock=clock)
+
+    client_kwargs: dict[str, Any] = {}
+    if transport is not None:
+        client_kwargs["transport"] = transport
+
+    async with httpx.AsyncClient(**client_kwargs) as internal_client:
+        return await _do_stream(
+            internal_client, url=url, headers=headers, body=body, clock=clock
+        )

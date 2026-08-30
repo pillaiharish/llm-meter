@@ -10,6 +10,7 @@ from llm_meter import __version__
 from llm_meter.metrics import derive_metrics
 from llm_meter.models import (
     BenchmarkRun,
+    BenchmarkSession,
     ClientMetrics,
     Completion,
     ErrorObservation,
@@ -19,6 +20,8 @@ from llm_meter.models import (
     ResponseEstablished,
     RunConfiguration,
     RunStatus,
+    SessionConfiguration,
+    SessionRequest,
     StreamEvent,
     TokenCountSource,
     Usage,
@@ -27,6 +30,7 @@ from llm_meter.models import (
 )
 
 SCHEMA_VERSION = "1"
+SESSION_SCHEMA_VERSION = "1"
 
 _SENSITIVE_QUERY_PARAMS = frozenset({
     "api_key",
@@ -294,4 +298,113 @@ def _dict_to_run(obj: dict[str, Any]) -> BenchmarkRun:
         error=error,
         usage=usage,
         metrics=metrics,
+    )
+
+
+def session_to_json(session: BenchmarkSession) -> str:
+    data: dict[str, Any] = {
+        "schema_version": session.schema_version,
+        "session_id": session.session_id,
+        "started_at": session.started_at,
+        "completed_at": session.completed_at,
+        "status": session.status,
+        "configuration": {
+            "endpoint": sanitize_endpoint(session.configuration.endpoint),
+            "model": session.configuration.model,
+            "warmup_requests": session.configuration.warmup_requests,
+            "measured_requests": session.configuration.measured_requests,
+            "concurrency": session.configuration.concurrency,
+            "seed": session.configuration.seed,
+            "seed_strategy": session.configuration.seed_strategy,
+            "max_connections": session.configuration.max_connections,
+            "max_keepalive_connections": session.configuration.max_keepalive_connections,
+            "prompt_source": session.configuration.prompt_source,
+            "input_tokens_target": session.configuration.input_tokens_target,
+            "output_tokens_target": session.configuration.output_tokens_target,
+            "tokenizer_id": session.configuration.tokenizer_id,
+            "max_output_tokens": session.configuration.max_output_tokens,
+        },
+        "requests": [
+            {
+                "phase": req.phase,
+                "ordinal": req.ordinal,
+                "session_start_offset_ns": req.session_start_offset_ns,
+                "session_finish_offset_ns": req.session_finish_offset_ns,
+                "run": json.loads(to_json(req.run)),
+            }
+            for req in session.requests
+        ],
+        "provenance": {"llm_meter_version": session.provenance.llm_meter_version},
+    }
+    return json.dumps(data, indent=2, sort_keys=False, ensure_ascii=False)
+
+
+def write_session(session: BenchmarkSession, path: str | Path) -> Path:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(session_to_json(session) + "\n", encoding="utf-8")
+    return output_path
+
+
+def session_from_json(data: str) -> BenchmarkSession:
+    obj: dict[str, Any] = json.loads(data)
+    encountered = obj.get("schema_version")
+    if encountered is None:
+        raise UnsupportedSchemaVersion(
+            f"missing schema_version; expected {SESSION_SCHEMA_VERSION!r}"
+        )
+    if encountered != SESSION_SCHEMA_VERSION:
+        raise UnsupportedSchemaVersion(
+            f"unsupported session schema version: expected {SESSION_SCHEMA_VERSION!r}, "
+            f"got {encountered!r}"
+        )
+    return _dict_to_session(obj)
+
+
+def _dict_to_session(obj: dict[str, Any]) -> BenchmarkSession:
+    config_data = obj["configuration"]
+    configuration = SessionConfiguration(
+        endpoint=config_data["endpoint"],
+        model=config_data["model"],
+        warmup_requests=config_data["warmup_requests"],
+        measured_requests=config_data["measured_requests"],
+        concurrency=config_data["concurrency"],
+        seed=config_data["seed"],
+        seed_strategy=config_data["seed_strategy"],
+        max_connections=config_data["max_connections"],
+        max_keepalive_connections=config_data["max_keepalive_connections"],
+        prompt_source=config_data["prompt_source"],
+        input_tokens_target=config_data.get("input_tokens_target"),
+        output_tokens_target=config_data.get("output_tokens_target"),
+        tokenizer_id=config_data.get("tokenizer_id"),
+        max_output_tokens=config_data.get("max_output_tokens"),
+    )
+
+    requests: list[SessionRequest] = []
+    for req_data in obj.get("requests", []):
+        run_json = json.dumps(req_data["run"])
+        run = from_json(run_json)
+        requests.append(
+            SessionRequest(
+                phase=req_data["phase"],
+                ordinal=req_data["ordinal"],
+                session_start_offset_ns=req_data["session_start_offset_ns"],
+                session_finish_offset_ns=req_data["session_finish_offset_ns"],
+                run=run,
+            )
+        )
+
+    provenance = Provenance(
+        llm_meter_version=obj.get("provenance", {}).get("llm_meter_version", ""),
+    )
+
+    return BenchmarkSession(
+        schema_version=obj["schema_version"],
+        session_id=obj["session_id"],
+        started_at=obj["started_at"],
+        completed_at=obj["completed_at"],
+        status=obj.get("status", "completed"),
+        configuration=configuration,
+        requests=requests,
+        provenance=provenance,
     )
