@@ -11,7 +11,6 @@ benchmarks — are welcome.
   before requesting review; both must pass.
 - Keep the **core measurement model engine-neutral**. Engine-specific logic
   belongs in adapters, not in the core.
-- Do not add comments to code unless explicitly requested.
 
 ## Benchmark claims
 

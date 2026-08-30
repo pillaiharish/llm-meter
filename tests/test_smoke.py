@@ -30,7 +30,7 @@ def test_cli_help(capsys: object) -> None:
     assert "llm-meter" in captured.out
 
 
-def test_cli_entrypoint_installed() -> None:
+def test_module_entrypoint() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "llm_meter.cli", "--version"],
         capture_output=True,

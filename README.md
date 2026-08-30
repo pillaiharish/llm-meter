@@ -43,31 +43,139 @@ but frequently omit enough context to answer:
 
 ## What llm-meter measures
 
-The metric vocabulary below defines the scope of `llm-meter`. Items marked **planned** are part of the target design and not yet implemented.
+`llm-meter` is about transparent inference metrology, so metrics are
+distinguished by **where they can actually be observed**. Not all metrics are
+available from a client benchmark alone; some require engine/runtime adapters
+or GPU/system telemetry integrations.
 
-### Request / latency metrics
+All metrics below are **planned** — part of the target design and not yet
+implemented.
+
+### Client-observable measurements
+
+Measurements available from an OpenAI-compatible client without modifying the
+inference server:
 
 | Metric | Description | Status |
 | --- | --- | --- |
-| TTFT | Time To First Token — latency from request submission to first generated token | planned |
-| TPOT | Time Per Output Token — average time between successive output tokens | planned |
-| ITL | Inter-Token Latency — per-token decode timing distribution | planned |
+| Request start | Timestamp when the request was submitted | planned |
+| Response/header timing | Timing captured in response headers where available | planned |
+| First streamed response event | Timestamp of the first SSE event arrival | planned |
+| Streamed chunk arrival timestamps | Per-chunk arrival timestamps during streaming | planned |
+| Completion timestamp | Timestamp when the response completed | planned |
+| HTTP/API errors | Error responses, status codes, and error timing | planned |
 | E2E latency | End-to-end request latency, submission to completion | planned |
-| Queue wait | Time spent queued before prefill begins | planned |
-| Request duration | Total wall-clock duration of a single request | planned |
-| Prefill timing | Prefill-phase timing where exposed by the serving engine | planned |
-| Decode timing | Decode-phase timing where exposed by the serving engine | planned |
+| Client-observed TTFT | Time To First Token — latency from request submission to first streamed response event | planned |
 
-### Throughput metrics
+A generic client can safely measure **stream event timestamps** and
+**inter-chunk latency** (time between successive SSE chunk arrivals).
+
+#### ITL versus streaming chunk latency
+
+Do **not** assume:
+
+> OpenAI SSE chunk == generated token
+
+A streamed response chunk may contain zero, one, or multiple token pieces
+depending on engine, protocol, and detokenization behavior. Therefore a generic
+client can safely measure stream-event timestamps and inter-chunk latency, but
+must only label a measurement as true token-level **ITL** (Inter-Token Latency)
+when a defensible token-to-timestamp relationship exists.
+
+`llm-meter` preserves **raw stream-event timestamps** so that later adapters
+with engine-specific knowledge can derive richer measurements (true per-token
+ITL) without losing the original raw observations.
 
 | Metric | Description | Status |
 | --- | --- | --- |
+| ITL | Inter-Token Latency — per-token decode timing, valid only when a defensible token-to-timestamp relationship exists | planned |
+| Inter-chunk latency | Time between successive streamed chunk arrivals | planned |
+
+### Token/count-derived measurements
+
+These measurements require an explicit token-count source:
+
+| Metric | Description | Status |
+| --- | --- | --- |
+| Input tokens | Prompt token count | planned |
+| Output tokens | Generated token count | planned |
 | Output tokens/sec | Generated token throughput | planned |
 | Input tokens/sec | Consumed prompt token throughput | planned |
 | Total tokens/sec | Input + output token throughput | planned |
-| Requests/sec | Completed request rate | planned |
-| Completed requests | Count of successfully completed requests | planned |
-| Failed requests | Count of failed requests | planned |
+| TPOT | Time Per Output Token, derived from token count + request timestamps | planned |
+
+The eventual benchmark artifact **must record how token counts were obtained**.
+Possible token-count sources include:
+
+- server-reported usage (e.g. OpenAI `usage` field)
+- engine-reported usage (e.g. vLLM metrics endpoint)
+- locally tokenized approximation (client-side tokenizer)
+
+**Never silently mix those sources.** A measurement derived from one source is
+not directly comparable to a measurement from another without explicit context.
+
+#### TPOT definition
+
+For a completed generation with more than one output token, `llm-meter` uses
+the following conventional client-derived definition:
+
+```
+TPOT = (E2E latency - TTFT) / (output_tokens - 1)
+```
+
+Important constraints:
+
+- The **exact token-count source** must be recorded in the artifact.
+- **Edge cases** such as `output_tokens <= 1` must be represented explicitly
+  rather than producing misleading values (e.g. division by zero or a single
+  token reporting zero TPOT).
+- **Raw timestamps and counts remain the source of truth.** TPOT is a derived
+  aggregate; the artifact should retain the underlying measurements so the
+  aggregate can be regenerated or reinterpreted.
+
+This formula is documented here as part of the V0 measurement contract. It is
+not yet implemented in code.
+
+### Server / runtime-observable measurements
+
+These measurements **cannot be inferred reliably from a generic OpenAI-compatible
+HTTP client**. They require an engine/runtime adapter or telemetry integration:
+
+| Metric | Description | Status |
+| --- | --- | --- |
+| Queue wait | Time spent queued in the scheduler before prefill begins | planned |
+| Prefill timing | Prefill-phase execution timing where exposed by the serving engine | planned |
+| Decode timing | Decode-phase execution timing where exposed by the serving engine | planned |
+| Scheduler state | Scheduler queue depth and batching state | planned |
+| KV-cache occupancy | KV-cache memory occupancy where exposed by the serving engine | planned |
+| KV-cache utilization | KV-cache utilization where exposed by the serving engine | planned |
+| Batch composition | Active batch size and request composition | planned |
+| Request duration | Total wall-clock duration of a single request within the engine | planned |
+
+### GPU / system-observable measurements
+
+These measurements require GPU/system telemetry sources such as
+NVML, DCGM, CUPTI, or profiler integrations depending on the metric.
+
+All GPU/system telemetry is **planned** and not yet implemented.
+
+| Telemetry | Description | Status |
+| --- | --- | --- |
+| GPU utilization | Device busy/utilization metric exposed by the selected telemetry provider | planned |
+| SM activity | Streaming-multiprocessor activity metric where supported | planned |
+| GPU memory usage | Used / free / total GPU memory | planned |
+| Memory activity/bandwidth | Memory activity or bandwidth metric where supported | planned |
+| Power | GPU power draw | planned |
+| Temperature | GPU temperature | planned |
+
+"GPU utilization" and "SM activity" are **separate measurements**. GPU
+utilization is a device-level busy/utilization metric exposed by the selected
+telemetry provider; SM activity is a streaming-multiprocessor-level activity
+metric where supported. They must not be conflated.
+
+The benchmark artifact should eventually record the **telemetry source/provider**
+(e.g. NVML, DCGM, CUPTI) alongside GPU measurements, so that the telemetry
+provenance is explicit and reproducible.
 
 ### Workload dimensions
 
@@ -81,20 +189,6 @@ The metric vocabulary below defines the scope of `llm-meter`. Items marked **pla
 | Streaming / non-streaming | Whether responses are streamed |
 | Warmup configuration | Warmup phase duration and shape |
 | Run duration | Measured phase length |
-
-### System / GPU telemetry
-
-All system and GPU telemetry is **planned** and not yet implemented.
-
-| Telemetry | Description | Status |
-| --- | --- | --- |
-| GPU utilization | SM activity percentage | planned |
-| GPU memory usage | Allocated / reserved GPU memory | planned |
-| Power | GPU power draw | planned |
-| Temperature | GPU temperature | planned |
-| SM activity | Per-SM activity where available | planned |
-| Memory bandwidth | Memory bandwidth related telemetry where available | planned |
-| KV-cache utilization | KV-cache occupancy where exposed by the serving engine | planned |
 
 ### Environment provenance
 
@@ -129,7 +223,11 @@ A slower benchmark that can be reproduced is more useful than an unexplained thr
 
 ### 2. Preserve raw measurements
 
-Do not only retain averages or percentiles. The architecture should eventually permit retaining per-request and per-token measurements so reports can be regenerated and re-analyzed without re-running the benchmark.
+Do not only retain averages or percentiles. The architecture should eventually
+permit retaining per-request, per-chunk, and per-token measurements so reports
+can be regenerated and re-analyzed without re-running the benchmark. Raw
+stream-event timestamps must be preserved so that later adapters can derive
+richer measurements without losing the original observations.
 
 ### 3. Separate observation from interpretation
 
@@ -277,6 +375,7 @@ BenchmarkRun
 ├── engine
 ├── workload
 ├── requests
+├── stream_events
 ├── token_timings
 ├── gpu_samples
 ├── engine_samples

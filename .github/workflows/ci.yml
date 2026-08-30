@@ -28,3 +28,11 @@ jobs:
 
       - name: Pytest
         run: uv run pytest
+
+      - name: Build
+        run: uv build
+
+      - name: Verify CLI entrypoint
+        run: |
+          uv run llm-meter --version
+          uv run llm-meter --help
