@@ -420,3 +420,171 @@ def test_run_one_max_output_tokens_zero_rejected_before_request(
         assert not mock_stream.called
         assert not mock_load.called
         assert not output_file.exists()
+
+
+def test_run_batch_help(capsys: object) -> None:
+    try:
+        main(["run-batch", "--help"])
+    except SystemExit as exc:
+        assert exc.code == 0
+    captured = capsys.readouterr()
+    assert "run-batch" in captured.out
+    assert "--endpoint" in captured.out
+    assert "--model" in captured.out
+    assert "--warmup-requests" in captured.out
+    assert "--requests" in captured.out
+    assert "--concurrency" in captured.out
+
+
+def test_run_batch_builtin_produces_session(
+    tmp_path: Path, capsys: object
+) -> None:
+    output_file = tmp_path / "session.json"
+
+    with patch("llm_meter.cli.stream_completion", return_value=_fake_observations()):
+        exit_code = main([
+            "run-batch",
+            "--endpoint", "http://localhost:8000/v1",
+            "--model", "test-model",
+            "--tokenizer", "fake",
+            "--input-tokens", "50",
+            "--max-output-tokens", "64",
+            "--warmup-requests", "2",
+            "--requests", "4",
+            "--concurrency", "2",
+            "--seed", "42",
+            "--output", str(output_file),
+        ])
+
+    assert exit_code == 0
+    assert output_file.exists()
+    data = json.loads(output_file.read_text())
+    assert data["schema_version"] == "1"
+    assert data["status"] == "completed"
+    assert len(data["requests"]) == 6
+    warmup = [r for r in data["requests"] if r["phase"] == "warmup"]
+    measured = [r for r in data["requests"] if r["phase"] == "measured"]
+    assert len(warmup) == 2
+    assert len(measured) == 4
+
+
+def test_run_batch_manual_produces_session(
+    tmp_path: Path, capsys: object
+) -> None:
+    output_file = tmp_path / "manual_session.json"
+
+    with patch("llm_meter.cli.stream_completion", return_value=_fake_observations()):
+        exit_code = main([
+            "run-batch",
+            "--endpoint", "http://localhost:8000/v1",
+            "--model", "test-model",
+            "--prompt", "hello world",
+            "--max-output-tokens", "64",
+            "--warmup-requests", "1",
+            "--requests", "3",
+            "--concurrency", "1",
+            "--output", str(output_file),
+        ])
+
+    assert exit_code == 0
+    assert output_file.exists()
+    data = json.loads(output_file.read_text())
+    assert len(data["requests"]) == 4
+
+
+def test_run_batch_requests_zero_rejected_before_tokenizer(
+    tmp_path: Path, capsys: object
+) -> None:
+    output_file = tmp_path / "should_not_exist.json"
+    with patch("llm_meter.cli.stream_completion") as mock_stream, \
+         patch("llm_meter.cli.load_tokenizer") as mock_load:
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "run-batch",
+                "--endpoint", "http://localhost:8000/v1",
+                "--model", "test-model",
+                "--tokenizer", "fake",
+                "--input-tokens", "50",
+                "--max-output-tokens", "64",
+                "--requests", "0",
+                "--output", str(output_file),
+            ])
+        assert exc_info.value.code != 0
+        captured = capsys.readouterr()
+        assert "requests" in captured.err.lower()
+        assert not mock_stream.called
+        assert not mock_load.called
+        assert not output_file.exists()
+
+
+def test_run_batch_concurrency_zero_rejected_before_tokenizer(
+    tmp_path: Path, capsys: object
+) -> None:
+    output_file = tmp_path / "should_not_exist.json"
+    with patch("llm_meter.cli.stream_completion") as mock_stream, \
+         patch("llm_meter.cli.load_tokenizer") as mock_load:
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "run-batch",
+                "--endpoint", "http://localhost:8000/v1",
+                "--model", "test-model",
+                "--tokenizer", "fake",
+                "--input-tokens", "50",
+                "--max-output-tokens", "64",
+                "--requests", "4",
+                "--concurrency", "0",
+                "--output", str(output_file),
+            ])
+        assert exc_info.value.code != 0
+        captured = capsys.readouterr()
+        assert "concurrency" in captured.err.lower()
+        assert not mock_stream.called
+        assert not mock_load.called
+        assert not output_file.exists()
+
+
+def test_run_batch_negative_warmup_rejected_before_tokenizer(
+    tmp_path: Path, capsys: object
+) -> None:
+    output_file = tmp_path / "should_not_exist.json"
+    with patch("llm_meter.cli.stream_completion") as mock_stream, \
+         patch("llm_meter.cli.load_tokenizer") as mock_load:
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "run-batch",
+                "--endpoint", "http://localhost:8000/v1",
+                "--model", "test-model",
+                "--tokenizer", "fake",
+                "--input-tokens", "50",
+                "--max-output-tokens", "64",
+                "--warmup-requests", "-1",
+                "--requests", "4",
+                "--output", str(output_file),
+            ])
+        assert exc_info.value.code != 0
+        captured = capsys.readouterr()
+        assert "warmup" in captured.err.lower()
+        assert not mock_stream.called
+        assert not mock_load.called
+        assert not output_file.exists()
+
+
+def test_run_batch_prompt_xor_input_tokens_rejected(
+    tmp_path: Path, capsys: object
+) -> None:
+    output_file = tmp_path / "should_not_exist.json"
+    with pytest.raises(SystemExit) as exc_info:
+        main([
+            "run-batch",
+            "--endpoint", "http://localhost:8000/v1",
+            "--model", "test-model",
+            "--prompt", "hi",
+            "--input-tokens", "50",
+            "--tokenizer", "fake",
+            "--max-output-tokens", "64",
+            "--requests", "4",
+            "--output", str(output_file),
+        ])
+    assert exc_info.value.code != 0
+    captured = capsys.readouterr()
+    assert "mutually exclusive" in captured.err
