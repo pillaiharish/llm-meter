@@ -6,7 +6,9 @@
 
 `llm-meter` is an open-source inference metrology toolkit for measuring and explaining LLM serving performance.
 
-It is designed to correlate request-level measurements such as TTFT, TPOT, inter-token latency, end-to-end latency, queueing time, and throughput with GPU and serving-runtime telemetry.
+It is designed to correlate request-level measurements such as TTFT, TPOT,
+client inter-chunk latency, end-to-end latency, queueing time, and throughput
+with GPU and serving-runtime telemetry.
 
 The goal is not merely to produce benchmark numbers. The goal is to make those numbers reproducible, comparable, and explainable.
 
@@ -89,7 +91,7 @@ ITL) without losing the original raw observations.
 | Metric | Description | Status |
 | --- | --- | --- |
 | ITL | Inter-Token Latency — per-token decode timing, valid only when a defensible token-to-timestamp relationship exists | planned |
-| Inter-chunk latency | Time between successive streamed chunk arrivals | planned |
+| Inter-chunk latency | Time between successive streamed chunk arrivals | implemented |
 
 ### Token/count-derived measurements
 
@@ -97,12 +99,12 @@ These measurements require an explicit token-count source:
 
 | Metric | Description | Status |
 | --- | --- | --- |
-| Input tokens | Prompt token count | planned |
-| Output tokens | Generated token count | planned |
-| Output tokens/sec | Generated token throughput | planned |
+| Input tokens | Prompt token count | implemented when server-reported |
+| Output tokens | Generated token count | implemented when server-reported |
+| Output tokens/sec | Generated token throughput | implemented for measured sessions with uniform provenance |
 | Input tokens/sec | Consumed prompt token throughput | planned |
 | Total tokens/sec | Input + output token throughput | planned |
-| TPOT | Time Per Output Token, derived from token count + request timestamps | planned |
+| TPOT | Time Per Output Token, derived from token count + request timestamps | implemented when inputs are available |
 
 The eventual benchmark artifact **must record how token counts were obtained**.
 Possible token-count sources include:
@@ -651,6 +653,50 @@ for future use but is not currently emitted by the runner.
 No API keys, secrets, or prompt text appear in the session artifact. Each
 nested `BenchmarkRun` preserves its own `WorkloadProvenance` and server `Usage`
 independently.
+
+### Measured-phase aggregation
+
+Each completed `run-batch` session includes a derived `summary` for the
+`measured` phase. Warmup requests remain in the raw `requests` array as
+execution evidence, but contribute zero samples to attempt counts, error
+rates, latency distributions, or throughput. Raw request observations remain
+authoritative and are sufficient to recompute the summary.
+
+TTFT, E2E, and TPOT distributions contain available per-request observations
+from successful measured requests. Each distribution has its own
+`sample_count`; a successful request can legitimately lack one metric. TPOT
+is included only when its request-level status is `ok`. Client inter-chunk
+intervals are flattened across successful measured requests, so requests that
+produce more observed chunks contribute more `chunk_interval` samples. This
+client inter-chunk distribution is not true token-level ITL.
+
+Percentiles use the deterministic `linear_type7` method. For sorted values
+`x`, quantile `q` is evaluated at `(len(x) - 1) * q` with linear interpolation
+between its surrounding samples. Empty distributions store `null`, not zero,
+for their bounds and percentiles.
+
+The throughput denominator is the measured-phase makespan:
+
+```
+max(measured session_finish_offset_ns)
+- min(measured session_start_offset_ns)
+```
+
+Attempted request throughput counts all measured attempts; completed request
+throughput counts successful measured requests. These client-observed rates
+are neither configured concurrency nor target QPS.
+
+Aggregate output-token throughput is the sum of successful measured output
+tokens divided by the complete measured makespan, including time spent by
+failed attempts. It is available only when every successful measured request
+has an output-token count from the same non-`unknown` source. Missing counts,
+mixed sources, unknown sources, no successful requests, and a non-positive
+makespan are recorded with explicit unavailable statuses. Failed or warmup
+token counts are not included.
+
+The request-level TPOT distribution and aggregate output-token throughput
+answer different questions: TPOT describes per-request decode timing, while
+output tokens/s describes completed workload output over wall-clock time.
 
 ---
 

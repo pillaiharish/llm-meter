@@ -155,10 +155,14 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _format_ms(ns: int | None) -> str:
+def _format_ms(ns: int | float | None) -> str:
     if ns is None:
         return "N/A"
     return f"{ns / 1_000_000:.2f} ms"
+
+
+def _format_per_second(value: float | None, unit: str) -> str:
+    return "N/A" if value is None else f"{value:.2f} {unit}"
 
 
 def _fail(message: str) -> None:
@@ -383,23 +387,40 @@ def _run_batch(args: argparse.Namespace) -> int:
     output_path = write_session(session, args.output)
 
     warmup_count = len(session.warmup_runs)
-    measured_count = len(session.measured_runs)
-    completed_count = sum(
-        1 for r in session.requests if r.run.run_status == "completed"
-    )
-    failed_count = sum(
-        1 for r in session.requests if r.run.run_status == "failed"
-    )
+    summary = session.summary
+    if summary is None:
+        raise RuntimeError("completed session has no measured summary")
 
     print(f"session_id:       {session.session_id}")
     print(f"schema_version:   {session.schema_version}")
     print(f"status:           {session.status}")
     print(f"warmup_requests:  {warmup_count}")
-    print(f"measured_requests: {measured_count}")
-    print(f"completed:        {completed_count}")
-    print(f"failed:           {failed_count}")
     print(f"concurrency:      {session.configuration.concurrency}")
     print(f"artifact:         {output_path}")
+    print("\nMeasured phase")
+    print(f"attempted:        {summary.attempts.attempted}")
+    print(f"completed:        {summary.attempts.completed}")
+    print(f"failed:           {summary.attempts.failed}")
+    print(f"error_rate:       {summary.attempts.error_rate:.2%}")
+    print(f"TTFT p50:         {_format_ms(summary.ttft.p50)}")
+    print(f"TTFT p95:         {_format_ms(summary.ttft.p95)}")
+    print(f"TTFT p99:         {_format_ms(summary.ttft.p99)}")
+    print(f"E2E p50:          {_format_ms(summary.e2e.p50)}")
+    print(f"E2E p95:          {_format_ms(summary.e2e.p95)}")
+    print(f"TPOT p50:         {_format_ms(summary.tpot.p50)}")
+    print(f"TPOT p95:         {_format_ms(summary.tpot.p95)}")
+    print(
+        "request throughput: "
+        f"{_format_per_second(summary.throughput.attempted_requests_per_s, 'attempts/s')}"
+    )
+    output_throughput = _format_per_second(
+        summary.throughput.output_tokens_per_s, "tokens/s"
+    )
+    if summary.throughput.output_token_source is not None:
+        output_throughput += f" ({summary.throughput.output_token_source})"
+    elif summary.throughput.output_tokens_per_s is None:
+        output_throughput += f" ({summary.throughput.output_token_status})"
+    print(f"output throughput: {output_throughput}")
 
     return 0 if session.status == "completed" else 1
 
