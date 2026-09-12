@@ -19,6 +19,7 @@ from llm_meter.models import (
     SessionRequest,
     SessionStatus,
 )
+from llm_meter.summary import summarize_session
 from llm_meter.workload import (
     PromptSource,
     RequestSpec,
@@ -279,7 +280,7 @@ async def run_session(
         max_output_tokens=plan.workload.output_tokens_target,
     )
 
-    return BenchmarkSession(
+    session = BenchmarkSession(
         schema_version="1",
         session_id=session_id,
         started_at=started_at,
@@ -289,3 +290,5 @@ async def run_session(
         requests=session_requests,
         provenance=Provenance(llm_meter_version=__version__),
     )
+    session.summary = summarize_session(session)
+    return session

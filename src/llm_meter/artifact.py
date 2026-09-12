@@ -9,10 +9,12 @@ from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 from llm_meter import __version__
 from llm_meter.metrics import derive_metrics
 from llm_meter.models import (
+    AttemptSummary,
     BenchmarkRun,
     BenchmarkSession,
     ClientMetrics,
     Completion,
+    DistributionSummary,
     ErrorObservation,
     Provenance,
     RawObservations,
@@ -22,7 +24,9 @@ from llm_meter.models import (
     RunStatus,
     SessionConfiguration,
     SessionRequest,
+    SessionSummary,
     StreamEvent,
+    ThroughputSummary,
     TokenCountSource,
     Usage,
     WorkloadProvenance,
@@ -335,6 +339,7 @@ def session_to_json(session: BenchmarkSession) -> str:
             for req in session.requests
         ],
         "provenance": {"llm_meter_version": session.provenance.llm_meter_version},
+        "summary": dataclass_to_dict(session.summary),
     }
     return json.dumps(data, indent=2, sort_keys=False, ensure_ascii=False)
 
@@ -398,13 +403,62 @@ def _dict_to_session(obj: dict[str, Any]) -> BenchmarkSession:
         llm_meter_version=obj.get("provenance", {}).get("llm_meter_version", ""),
     )
 
+    summary = _dict_to_summary(obj["summary"]) if obj.get("summary") else None
+
     return BenchmarkSession(
         schema_version=obj["schema_version"],
         session_id=obj["session_id"],
         started_at=obj["started_at"],
         completed_at=obj["completed_at"],
-        status=obj.get("status", "completed"),
+        status=obj["status"],
         configuration=configuration,
         requests=requests,
         provenance=provenance,
+        summary=summary,
+    )
+
+
+def _dict_to_summary(obj: dict[str, Any]) -> SessionSummary:
+    def distribution(data: dict[str, Any]) -> DistributionSummary:
+        return DistributionSummary(
+            sample_count=data["sample_count"],
+            sample_unit=data["sample_unit"],
+            unit=data["unit"],
+            minimum=data.get("minimum"),
+            maximum=data.get("maximum"),
+            p50=data.get("p50"),
+            p90=data.get("p90"),
+            p95=data.get("p95"),
+            p99=data.get("p99"),
+        )
+
+    attempts_data = obj["attempts"]
+    attempts = AttemptSummary(
+        attempted=attempts_data["attempted"],
+        completed=attempts_data["completed"],
+        failed=attempts_data["failed"],
+        success_rate=attempts_data["success_rate"],
+        error_rate=attempts_data["error_rate"],
+        errors_by_category=attempts_data["errors_by_category"],
+    )
+    throughput_data = obj["throughput"]
+    throughput = ThroughputSummary(
+        measured_duration_ns=throughput_data.get("measured_duration_ns"),
+        attempted_requests_per_s=throughput_data.get("attempted_requests_per_s"),
+        completed_requests_per_s=throughput_data.get("completed_requests_per_s"),
+        output_tokens_total=throughput_data.get("output_tokens_total"),
+        output_tokens_per_s=throughput_data.get("output_tokens_per_s"),
+        output_token_source=throughput_data.get("output_token_source"),
+        output_token_status=throughput_data["output_token_status"],
+    )
+    return SessionSummary(
+        summary_version=obj["summary_version"],
+        phase=obj["phase"],
+        percentile_method=obj["percentile_method"],
+        attempts=attempts,
+        ttft=distribution(obj["ttft"]),
+        e2e=distribution(obj["e2e"]),
+        tpot=distribution(obj["tpot"]),
+        inter_chunk=distribution(obj["inter_chunk"]),
+        throughput=throughput,
     )

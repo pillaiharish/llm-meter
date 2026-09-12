@@ -35,6 +35,15 @@ class SessionStatus(StrEnum):
     FAILED = "failed"  # reserved: runner-level failures raise; no partial session is serialized
 
 
+class OutputTokenStatus(StrEnum):
+    OK = "ok"
+    NO_SUCCESSFUL_REQUESTS = "no_successful_requests"
+    MISSING_OUTPUT_TOKEN_COUNTS = "missing_output_token_counts"
+    MIXED_TOKEN_COUNT_SOURCES = "mixed_token_count_sources"
+    UNKNOWN_TOKEN_COUNT_SOURCE = "unknown_token_count_source"
+    NON_POSITIVE_MEASURED_DURATION = "non_positive_measured_duration"
+
+
 class SeedStrategy(StrEnum):
     BASE_PLUS_GLOBAL_ORDINAL = "base_plus_global_ordinal"
 
@@ -177,6 +186,53 @@ class SessionRequest:
 
 
 @dataclass
+class AttemptSummary:
+    attempted: int
+    completed: int
+    failed: int
+    success_rate: float
+    error_rate: float
+    errors_by_category: dict[str, int]
+
+
+@dataclass
+class DistributionSummary:
+    sample_count: int
+    sample_unit: str
+    unit: str
+    minimum: float | None
+    maximum: float | None
+    p50: float | None
+    p90: float | None
+    p95: float | None
+    p99: float | None
+
+
+@dataclass
+class ThroughputSummary:
+    measured_duration_ns: int | None
+    attempted_requests_per_s: float | None
+    completed_requests_per_s: float | None
+    output_tokens_total: int | None
+    output_tokens_per_s: float | None
+    output_token_source: str | None
+    output_token_status: str
+
+
+@dataclass
+class SessionSummary:
+    summary_version: str
+    phase: str
+    percentile_method: str
+    attempts: AttemptSummary
+    ttft: DistributionSummary
+    e2e: DistributionSummary
+    tpot: DistributionSummary
+    inter_chunk: DistributionSummary
+    throughput: ThroughputSummary
+
+
+@dataclass
 class BenchmarkSession:
     schema_version: str
     session_id: str
@@ -186,6 +242,7 @@ class BenchmarkSession:
     configuration: SessionConfiguration
     requests: list[SessionRequest]
     provenance: Provenance
+    summary: SessionSummary | None = None
 
     @property
     def warmup_runs(self) -> list[SessionRequest]:

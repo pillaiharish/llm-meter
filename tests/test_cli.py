@@ -466,6 +466,23 @@ def test_run_batch_builtin_produces_session(
     measured = [r for r in data["requests"] if r["phase"] == "measured"]
     assert len(warmup) == 2
     assert len(measured) == 4
+    assert data["summary"]["phase"] == "measured"
+    assert data["summary"]["attempts"] == {
+        "attempted": 4,
+        "completed": 4,
+        "failed": 0,
+        "success_rate": 1.0,
+        "error_rate": 0.0,
+        "errors_by_category": {},
+    }
+
+    captured = capsys.readouterr()
+    assert "Measured phase" in captured.out
+    assert "attempted:        4" in captured.out
+    assert "TTFT p50:" in captured.out
+    assert "request throughput:" in captured.out
+    assert "output throughput:" in captured.out
+    assert "server_reported" in captured.out
 
 
 def test_run_batch_manual_produces_session(
