@@ -360,27 +360,54 @@ not yet implemented.
 ```bash
 export LLM_METER_API_KEY="your-api-key"   # optional, if the endpoint requires auth
 
-# Mode A: manual prompt (optionally with a tokenizer for local token counting)
-llm-meter run-one \
+# Reproducible generated workload
+llm-meter run \
   --endpoint http://localhost:8000/v1 \
-  --model some-model \
-  --prompt "Explain dynamic batching briefly." \
-  --max-output-tokens 64 \
-  --output run.json
-
-# Mode B: tokenizer-aware workload construction (reproducible prompt)
-llm-meter run-one \
-  --endpoint http://localhost:8000/v1 \
-  --model some-model \
+  --model Qwen/Qwen3-8B \
   --tokenizer Qwen/Qwen3-8B \
-  --input-tokens 512 \
+  --input-tokens 1024 \
   --max-output-tokens 128 \
+  --warmup-requests 5 \
+  --requests 100 \
+  --concurrency 8 \
   --seed 42 \
-  --output run.json
+  --output-dir ./results/qwen-c8 \
+  --csv
 ```
 
-The command performs exactly one streaming request, saves a `BenchmarkRun`
-artifact to the specified path, and prints a concise summary.
+Manual workloads use the same command:
+
+```bash
+llm-meter run \
+  --endpoint http://localhost:8000/v1 \
+  --model Qwen/Qwen3-8B \
+  --prompt "Explain dynamic batching." \
+  --max-output-tokens 128 \
+  --warmup-requests 2 \
+  --requests 20 \
+  --concurrency 2 \
+  --output-dir ./results/manual \
+  --csv
+```
+
+`--requests` is required. Warmup defaults to `0`, concurrency to `1`, and the
+seed to `0`. If `--output-dir` is omitted, artifacts are written under
+`./llm-meter-runs/<session-id>/`. Existing artifact files are never
+overwritten.
+
+Every successful benchmark writes `session.json`, the canonical lossless
+artifact. With `--csv`, two deterministic analysis views are also written:
+
+```text
+<output-dir>/
+├── session.json   canonical configuration, raw evidence, summary, and environment
+├── requests.csv  one row per warmup or measured request
+└── summary.csv   long-form measured-phase aggregate rows
+```
+
+CSV stores raw nanoseconds, rates, counts, and fractions with empty fields for
+unavailable values. It intentionally does not flatten environment provenance
+or preserve all raw observations. CSV is not the canonical artifact; JSON is.
 
 `--prompt` and `--input-tokens` are mutually exclusive. `--input-tokens`
 requires `--tokenizer`. Manual `--prompt` may optionally specify `--tokenizer`
@@ -395,6 +422,11 @@ request simply omits `max_tokens`.
 Hugging Face tokenizer loading (`--tokenizer Qwen/Qwen3-8B`) may require
 network access or a populated local tokenizer cache. CI for llm-meter itself
 remains network-free; tests use a deterministic `FakeTokenizer`.
+
+The older `run-one` and `run-batch` commands remain available as experimental
+compatibility interfaces. `run` is the recommended workflow; the legacy
+commands may be removed or formally deprecated after the stable CLI has
+existed for a release.
 
 ### Workload specification
 
@@ -513,7 +545,7 @@ Absent data is represented as `null` rather than fabricated. No API keys or
 secrets appear in the artifact. Prompt text is **not** persisted in the
 artifact — only its SHA-256 fingerprint and character count.
 
-### `run-batch` — multi-request benchmark
+### Legacy `run-batch` — multi-request benchmark
 
 Execute warmup requests followed by measured requests at a fixed concurrency:
 
@@ -915,12 +947,11 @@ Apache License 2.0. See [LICENSE](LICENSE).
 
 ## Status
 
-`llm-meter` is under active development. The experimental commands `run-one`
-and `run-batch` can perform single-request and multi-request benchmarks,
-producing `BenchmarkRun` and `BenchmarkSession` JSON artifacts with
-deterministic, tokenizer-aware workload specification and prompt fingerprinting.
-The `workload inspect` command resolves a workload specification without making
-any network request.
+`llm-meter` is under active development. The canonical `run` command produces
+a lossless `BenchmarkSession` JSON artifact and optional CSV analysis views.
+The experimental `run-one` and `run-batch` commands remain as compatibility
+interfaces. The `workload inspect` command resolves a workload specification
+without making any network request.
 
 Implemented:
 
@@ -934,10 +965,11 @@ Implemented:
 - measured-phase percentile, throughput, and error-rate summary
 - local client/runtime environment provenance
 - optional local NVIDIA device identity through `nvidia-smi`
+- canonical `run` CLI and safe output-directory layout
+- deterministic per-request and aggregate CSV analysis views
 
 Still planned:
 
-- CSV export
 - run-to-run comparison
 - GPU telemetry
 - engine-specific adapters

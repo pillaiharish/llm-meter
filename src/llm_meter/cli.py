@@ -5,13 +5,16 @@ import asyncio
 import os
 import sys
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from llm_meter import __version__
 from llm_meter.artifact import build_run, write_artifact, write_session
 from llm_meter.client import Clock, stream_completion
-from llm_meter.models import RunConfiguration, WorkloadProvenance
+from llm_meter.export import write_requests_csv, write_summary_csv
+from llm_meter.models import BenchmarkSession, RunConfiguration, WorkloadProvenance
 from llm_meter.runner import BenchmarkPlan, RequestExecutor, run_session
 from llm_meter.tokenizer import load_tokenizer
 from llm_meter.workload import (
@@ -20,6 +23,58 @@ from llm_meter.workload import (
     WorkloadSpec,
     resolve_workload,
 )
+
+
+def _add_workload_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--endpoint", required=True, help="OpenAI-compatible base URL (e.g. http://localhost:8000/v1)"
+    )
+    parser.add_argument("--model", required=True, help="Model name")
+    parser.add_argument(
+        "--prompt", default=None, help="Prompt text (mutually exclusive with --input-tokens)"
+    )
+    parser.add_argument(
+        "--tokenizer",
+        default=None,
+        help="Tokenizer ID for local token counting / prompt construction",
+    )
+    parser.add_argument(
+        "--input-tokens",
+        type=int,
+        default=None,
+        help="Target input token count (requires --tokenizer, mutually exclusive with --prompt)",
+    )
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=None,
+        help="Maximum output tokens (also used as workload output_tokens_target)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0, help="Deterministic workload seed (default: 0)"
+    )
+
+
+def _add_session_arguments(parser: argparse.ArgumentParser) -> None:
+    _add_workload_arguments(parser)
+    parser.add_argument(
+        "--warmup-requests",
+        type=int,
+        default=0,
+        help="Number of warmup requests (default: 0)",
+    )
+    parser.add_argument(
+        "--requests",
+        type=int,
+        required=True,
+        help="Number of measured requests (must be > 0)",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Maximum simultaneous in-flight requests (default: 1)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,90 +92,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command")
 
+    run = subparsers.add_parser(
+        "run",
+        help="Run a benchmark and write its canonical session artifact.",
+        description="Run a benchmark and write its canonical session artifact.",
+    )
+    _add_session_arguments(run)
+    run.add_argument(
+        "--output-dir",
+        default=None,
+        help="Artifact directory (default: ./llm-meter-runs/<session-id>)",
+    )
+    run.add_argument(
+        "--csv",
+        action="store_true",
+        help="Also write requests.csv and summary.csv analysis views",
+    )
+
     run_one = subparsers.add_parser(
         "run-one",
-        help="Execute a single streaming request and save a BenchmarkRun artifact (experimental).",
+        help="Legacy experimental single-request interface.",
+        description="Legacy experimental single-request interface.",
     )
-    run_one.add_argument(
-        "--endpoint", required=True, help="OpenAI-compatible base URL (e.g. http://localhost:8000/v1)"
-    )
-    run_one.add_argument("--model", required=True, help="Model name")
-    run_one.add_argument(
-        "--prompt", default=None, help="Prompt text (mutually exclusive with --input-tokens)"
-    )
-    run_one.add_argument(
-        "--tokenizer",
-        default=None,
-        help="Tokenizer ID for local token counting / prompt construction",
-    )
-    run_one.add_argument(
-        "--input-tokens",
-        type=int,
-        default=None,
-        help="Target input token count (requires --tokenizer, mutually exclusive with --prompt)",
-    )
-    run_one.add_argument(
-        "--max-output-tokens",
-        type=int,
-        default=None,
-        help="Maximum output tokens (also used as workload output_tokens_target)",
-    )
-    run_one.add_argument(
-        "--seed", type=int, default=0, help="Deterministic workload seed (default: 0)"
-    )
+    _add_workload_arguments(run_one)
     run_one.add_argument(
         "--output", default="run.json", help="Output artifact path (default: run.json)"
     )
 
     run_batch = subparsers.add_parser(
         "run-batch",
-        help="Execute warmup + measured requests at fixed concurrency (experimental).",
+        help="Legacy experimental multi-request interface.",
+        description="Legacy experimental multi-request interface.",
     )
-    run_batch.add_argument(
-        "--endpoint", required=True, help="OpenAI-compatible base URL (e.g. http://localhost:8000/v1)"
-    )
-    run_batch.add_argument("--model", required=True, help="Model name")
-    run_batch.add_argument(
-        "--prompt", default=None, help="Prompt text (mutually exclusive with --input-tokens)"
-    )
-    run_batch.add_argument(
-        "--tokenizer",
-        default=None,
-        help="Tokenizer ID for local token counting / prompt construction",
-    )
-    run_batch.add_argument(
-        "--input-tokens",
-        type=int,
-        default=None,
-        help="Target input token count (requires --tokenizer, mutually exclusive with --prompt)",
-    )
-    run_batch.add_argument(
-        "--max-output-tokens",
-        type=int,
-        default=None,
-        help="Maximum output tokens (also used as workload output_tokens_target)",
-    )
-    run_batch.add_argument(
-        "--warmup-requests",
-        type=int,
-        default=0,
-        help="Number of warmup requests (default: 0)",
-    )
-    run_batch.add_argument(
-        "--requests",
-        type=int,
-        required=True,
-        help="Number of measured requests (must be > 0)",
-    )
-    run_batch.add_argument(
-        "--concurrency",
-        type=int,
-        default=1,
-        help="Maximum simultaneous in-flight requests (default: 1)",
-    )
-    run_batch.add_argument(
-        "--seed", type=int, default=0, help="Deterministic workload seed (default: 0)"
-    )
+    _add_session_arguments(run_batch)
     run_batch.add_argument(
         "--output",
         default="session.json",
@@ -352,10 +356,16 @@ def _validate_batch_inputs(args: argparse.Namespace) -> None:
     _validate_cli_inputs(args)
 
 
-def _run_batch(args: argparse.Namespace) -> int:
+def _execute_session(
+    args: argparse.Namespace,
+    *,
+    preflight: Callable[[], None] | None = None,
+) -> BenchmarkSession:
     _validate_batch_inputs(args)
 
     spec, manual_prompt, source = _build_workload_spec(args)
+    if preflight is not None:
+        preflight()
     tokenizer = load_tokenizer(args.tokenizer)
 
     plan = BenchmarkPlan(
@@ -372,7 +382,7 @@ def _run_batch(args: argparse.Namespace) -> int:
         api_key=api_key,
     )
 
-    session = asyncio.run(
+    return asyncio.run(
         run_session(
             plan,
             executor,
@@ -384,8 +394,8 @@ def _run_batch(args: argparse.Namespace) -> int:
         )
     )
 
-    output_path = write_session(session, args.output)
 
+def _print_session_summary(session: BenchmarkSession, output_path: Path) -> None:
     warmup_count = len(session.warmup_runs)
     summary = session.summary
     if summary is None:
@@ -411,7 +421,7 @@ def _run_batch(args: argparse.Namespace) -> int:
     print(f"TPOT p95:         {_format_ms(summary.tpot.p95)}")
     print(
         "request throughput: "
-        f"{_format_per_second(summary.throughput.attempted_requests_per_s, 'attempts/s')}"
+        f"{_format_per_second(summary.throughput.attempted_requests_per_s, 'requests/s')}"
     )
     output_throughput = _format_per_second(
         summary.throughput.output_tokens_per_s, "tokens/s"
@@ -421,6 +431,52 @@ def _run_batch(args: argparse.Namespace) -> int:
     elif summary.throughput.output_tokens_per_s is None:
         output_throughput += f" ({summary.throughput.output_token_status})"
     print(f"output throughput: {output_throughput}")
+
+
+def _fail_if_outputs_exist(paths: list[Path]) -> None:
+    existing = [str(path) for path in paths if path.exists()]
+    if existing:
+        _fail(f"refusing to overwrite existing artifact: {', '.join(existing)}")
+
+
+def _run_canonical(args: argparse.Namespace) -> int:
+    explicit_output_dir = Path(args.output_dir) if args.output_dir is not None else None
+
+    def preflight() -> None:
+        if explicit_output_dir is None:
+            return
+        if explicit_output_dir.exists() and not explicit_output_dir.is_dir():
+            _fail(f"--output-dir is not a directory: {explicit_output_dir}")
+        names = ["session.json"]
+        if args.csv:
+            names.extend(["requests.csv", "summary.csv"])
+        _fail_if_outputs_exist([explicit_output_dir / name for name in names])
+
+    session = _execute_session(args, preflight=preflight)
+    output_dir = explicit_output_dir or Path("llm-meter-runs") / session.session_id
+    paths = [output_dir / "session.json"]
+    if args.csv:
+        paths.extend([output_dir / "requests.csv", output_dir / "summary.csv"])
+    _fail_if_outputs_exist(paths)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = write_session(session, paths[0])
+    if args.csv:
+        write_requests_csv(session, paths[1])
+        write_summary_csv(session, paths[2])
+
+    _print_session_summary(session, output_path)
+    return 0 if session.status == "completed" else 1
+
+
+def _run_batch(args: argparse.Namespace) -> int:
+    output_path = Path(args.output)
+    session = _execute_session(
+        args,
+        preflight=lambda: _fail_if_outputs_exist([output_path]),
+    )
+    output_path = write_session(session, output_path)
+    _print_session_summary(session, output_path)
 
     return 0 if session.status == "completed" else 1
 
@@ -467,6 +523,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.command == "run":
+        return _run_canonical(args)
     if args.command == "run-one":
         return _run_one(args)
     if args.command == "run-batch":

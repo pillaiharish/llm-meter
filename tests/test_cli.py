@@ -46,6 +46,7 @@ def test_run_one_help(capsys: object) -> None:
         assert exc.code == 0
     captured = capsys.readouterr()
     assert "run-one" in captured.out
+    assert "Legacy experimental" in captured.out
     assert "--endpoint" in captured.out
     assert "--model" in captured.out
     assert "--prompt" in captured.out
@@ -429,6 +430,7 @@ def test_run_batch_help(capsys: object) -> None:
         assert exc.code == 0
     captured = capsys.readouterr()
     assert "run-batch" in captured.out
+    assert "Legacy experimental" in captured.out
     assert "--endpoint" in captured.out
     assert "--model" in captured.out
     assert "--warmup-requests" in captured.out
@@ -605,3 +607,238 @@ def test_run_batch_prompt_xor_input_tokens_rejected(
     assert exc_info.value.code != 0
     captured = capsys.readouterr()
     assert "mutually exclusive" in captured.err
+
+
+def test_run_help(capsys: object) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(["run", "--help"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    for option in (
+        "--endpoint",
+        "--model",
+        "--prompt",
+        "--input-tokens",
+        "--requests",
+        "--concurrency",
+        "--output-dir",
+        "--csv",
+    ):
+        assert option in output
+
+
+def test_run_manual_writes_only_canonical_json_without_csv(
+    tmp_path: Path, capsys: object
+) -> None:
+    output_dir = tmp_path / "manual"
+
+    with patch("llm_meter.cli.stream_completion", return_value=_fake_observations()):
+        exit_code = main([
+            "run",
+            "--endpoint", "http://localhost:8000/v1",
+            "--model", "test-model",
+            "--prompt", "hello",
+            "--requests", "2",
+            "--output-dir", str(output_dir),
+        ])
+
+    assert exit_code == 0
+    assert [path.name for path in output_dir.iterdir()] == ["session.json"]
+    data = json.loads((output_dir / "session.json").read_text())
+    assert data["configuration"]["prompt_source"] == "manual"
+    assert data["configuration"]["warmup_requests"] == 0
+    assert data["configuration"]["concurrency"] == 1
+    assert len(data["requests"]) == 2
+    output = capsys.readouterr().out
+    assert "Measured phase" in output
+    assert str(output_dir / "session.json") in output
+
+
+def test_run_generated_writes_optional_csv_views(tmp_path: Path) -> None:
+    output_dir = tmp_path / "generated"
+
+    with patch("llm_meter.cli.stream_completion", return_value=_fake_observations()):
+        exit_code = main([
+            "run",
+            "--endpoint", "http://localhost:8000/v1",
+            "--model", "test-model",
+            "--tokenizer", "fake",
+            "--input-tokens", "50",
+            "--max-output-tokens", "64",
+            "--warmup-requests", "1",
+            "--requests", "2",
+            "--concurrency", "2",
+            "--seed", "42",
+            "--output-dir", str(output_dir),
+            "--csv",
+        ])
+
+    assert exit_code == 0
+    assert sorted(path.name for path in output_dir.iterdir()) == [
+        "requests.csv",
+        "session.json",
+        "summary.csv",
+    ]
+    data = json.loads((output_dir / "session.json").read_text())
+    assert data["configuration"]["prompt_source"] == "builtin"
+    assert data["configuration"]["input_tokens_target"] == 50
+    assert data["configuration"]["output_tokens_target"] == 64
+    assert data["environment"]["version"] == "1"
+    assert "stream_events" in data["requests"][0]["run"]
+    request_header = (output_dir / "requests.csv").read_text().splitlines()[0]
+    assert "environment" not in request_header
+    assert "stream_events" not in request_header
+
+
+def test_run_default_output_directory_uses_session_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    with patch("llm_meter.cli.stream_completion", return_value=_fake_observations()):
+        assert main([
+            "run",
+            "--endpoint", "http://localhost:8000/v1",
+            "--model", "test-model",
+            "--prompt", "hello",
+            "--requests", "1",
+        ]) == 0
+
+    session_files = list((tmp_path / "llm-meter-runs").glob("*/session.json"))
+    assert len(session_files) == 1
+    session = json.loads(session_files[0].read_text())
+    assert session_files[0].parent.name == session["session_id"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        [
+            "--prompt", "hello",
+            "--input-tokens", "5",
+            "--tokenizer", "fake",
+            "--max-output-tokens", "4",
+        ],
+        ["--input-tokens", "5", "--max-output-tokens", "4"],
+        ["--input-tokens", "5", "--tokenizer", "fake"],
+        ["--input-tokens", "0", "--tokenizer", "fake", "--max-output-tokens", "4"],
+        ["--prompt", "hello", "--max-output-tokens", "0"],
+        ["--prompt", "hello", "--requests", "0"],
+        ["--prompt", "hello", "--concurrency", "0"],
+        ["--prompt", "hello", "--warmup-requests", "-1"],
+        [],
+    ],
+)
+def test_run_validation_precedes_side_effects(
+    arguments: list[str], tmp_path: Path
+) -> None:
+    output_dir = tmp_path / "must-not-exist"
+    base = [
+        "run",
+        "--endpoint", "http://localhost:8000/v1",
+        "--model", "test-model",
+        "--requests", "1",
+        "--output-dir", str(output_dir),
+    ]
+
+    with (
+        patch("llm_meter.cli.load_tokenizer") as tokenizer,
+        patch("llm_meter.cli.run_session") as runner,
+        patch("llm_meter.cli.stream_completion") as network,
+        pytest.raises(SystemExit),
+    ):
+        main(base + arguments)
+
+    tokenizer.assert_not_called()
+    runner.assert_not_called()
+    network.assert_not_called()
+    assert not output_dir.exists()
+
+
+def test_run_refuses_existing_artifact_before_execution(tmp_path: Path) -> None:
+    output_dir = tmp_path / "existing"
+    output_dir.mkdir()
+    artifact = output_dir / "session.json"
+    artifact.write_text("original\n")
+
+    with patch("llm_meter.cli.stream_completion") as network, pytest.raises(SystemExit):
+        main([
+            "run",
+            "--endpoint", "http://localhost:8000/v1",
+            "--model", "test-model",
+            "--prompt", "hello",
+            "--requests", "1",
+            "--output-dir", str(output_dir),
+        ])
+
+    assert artifact.read_text() == "original\n"
+    network.assert_not_called()
+
+
+def test_run_runner_failure_writes_no_artifacts(tmp_path: Path) -> None:
+    output_dir = tmp_path / "failed"
+
+    with patch("llm_meter.cli.run_session", side_effect=RuntimeError("runner failed")):
+        with pytest.raises(RuntimeError, match="runner failed"):
+            main([
+                "run",
+                "--endpoint", "http://localhost:8000/v1",
+                "--model", "test-model",
+                "--prompt", "hello",
+                "--requests", "1",
+                "--output-dir", str(output_dir),
+                "--csv",
+            ])
+
+    assert not output_dir.exists()
+
+
+def test_run_request_failure_still_writes_artifact_and_exits_zero(tmp_path: Path) -> None:
+    from llm_meter.models import ErrorObservation
+
+    failed = RawObservations(
+        request_start=RequestStart(offset_ns=0, wall_clock_utc="2025-01-01T00:00:00Z"),
+        stream_events=[],
+        error=ErrorObservation(offset_ns=10, category="http_error", status=503),
+    )
+    output_dir = tmp_path / "request-failed"
+
+    with patch("llm_meter.cli.stream_completion", return_value=failed):
+        exit_code = main([
+            "run",
+            "--endpoint", "http://localhost:8000/v1",
+            "--model", "test-model",
+            "--prompt", "hello",
+            "--requests", "1",
+            "--output-dir", str(output_dir),
+        ])
+
+    assert exit_code == 0
+    data = json.loads((output_dir / "session.json").read_text())
+    assert data["status"] == "completed"
+    assert data["requests"][0]["run"]["run_status"] == "failed"
+    assert data["summary"]["attempts"]["failed"] == 1
+
+
+def test_run_csv_failure_preserves_completed_canonical_json(tmp_path: Path) -> None:
+    output_dir = tmp_path / "csv-failed"
+
+    with (
+        patch("llm_meter.cli.stream_completion", return_value=_fake_observations()),
+        patch("llm_meter.cli.write_requests_csv", side_effect=OSError("disk error")),
+        pytest.raises(OSError, match="disk error"),
+    ):
+        main([
+            "run",
+            "--endpoint", "http://localhost:8000/v1",
+            "--model", "test-model",
+            "--prompt", "hello",
+            "--requests", "1",
+            "--output-dir", str(output_dir),
+            "--csv",
+        ])
+
+    data = json.loads((output_dir / "session.json").read_text())
+    assert data["status"] == "completed"
+    assert not (output_dir / "summary.csv").exists()
