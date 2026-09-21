@@ -632,6 +632,8 @@ def test_run_manual_writes_only_canonical_json_without_csv(
     tmp_path: Path, capsys: object
 ) -> None:
     output_dir = tmp_path / "manual"
+    output_dir.mkdir()
+    (output_dir / "notes.txt").write_text("keep me\n")
 
     with patch("llm_meter.cli.stream_completion", return_value=_fake_observations()):
         exit_code = main([
@@ -644,7 +646,7 @@ def test_run_manual_writes_only_canonical_json_without_csv(
         ])
 
     assert exit_code == 0
-    assert [path.name for path in output_dir.iterdir()] == ["session.json"]
+    assert sorted(path.name for path in output_dir.iterdir()) == ["notes.txt", "session.json"]
     data = json.loads((output_dir / "session.json").read_text())
     assert data["configuration"]["prompt_source"] == "manual"
     assert data["configuration"]["warmup_requests"] == 0
@@ -756,23 +758,40 @@ def test_run_validation_precedes_side_effects(
     assert not output_dir.exists()
 
 
-def test_run_refuses_existing_artifact_before_execution(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reserved_name", ["session.json", "requests.csv", "summary.csv"])
+@pytest.mark.parametrize("use_csv", [False, True])
+def test_run_refuses_reserved_artifacts_before_execution(
+    reserved_name: str, use_csv: bool, tmp_path: Path
+) -> None:
     output_dir = tmp_path / "existing"
     output_dir.mkdir()
-    artifact = output_dir / "session.json"
+    artifact = output_dir / reserved_name
     artifact.write_text("original\n")
 
-    with patch("llm_meter.cli.stream_completion") as network, pytest.raises(SystemExit):
+    arguments = [
+        "run",
+        "--endpoint", "http://localhost:8000/v1",
+        "--model", "test-model",
+        "--prompt", "hello",
+        "--requests", "1",
+        "--output-dir", str(output_dir),
+    ]
+    if use_csv:
+        arguments.append("--csv")
+
+    with (
+        patch("llm_meter.cli.load_tokenizer") as tokenizer,
+        patch("llm_meter.cli.run_session") as runner,
+        patch("llm_meter.cli.stream_completion") as network,
+        pytest.raises(SystemExit),
+    ):
         main([
-            "run",
-            "--endpoint", "http://localhost:8000/v1",
-            "--model", "test-model",
-            "--prompt", "hello",
-            "--requests", "1",
-            "--output-dir", str(output_dir),
+            *arguments,
         ])
 
     assert artifact.read_text() == "original\n"
+    tokenizer.assert_not_called()
+    runner.assert_not_called()
     network.assert_not_called()
 
 
@@ -821,12 +840,12 @@ def test_run_request_failure_still_writes_artifact_and_exits_zero(tmp_path: Path
     assert data["summary"]["attempts"]["failed"] == 1
 
 
-def test_run_csv_failure_preserves_completed_canonical_json(tmp_path: Path) -> None:
+def test_run_summary_csv_failure_removes_current_csv_exports(tmp_path: Path) -> None:
     output_dir = tmp_path / "csv-failed"
 
     with (
         patch("llm_meter.cli.stream_completion", return_value=_fake_observations()),
-        patch("llm_meter.cli.write_requests_csv", side_effect=OSError("disk error")),
+        patch("llm_meter.cli.write_summary_csv", side_effect=OSError("disk error")),
         pytest.raises(OSError, match="disk error"),
     ):
         main([
@@ -841,4 +860,5 @@ def test_run_csv_failure_preserves_completed_canonical_json(tmp_path: Path) -> N
 
     data = json.loads((output_dir / "session.json").read_text())
     assert data["status"] == "completed"
+    assert not (output_dir / "requests.csv").exists()
     assert not (output_dir / "summary.csv").exists()

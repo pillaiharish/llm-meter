@@ -24,6 +24,8 @@ from llm_meter.workload import (
     resolve_workload,
 )
 
+_RESERVED_OUTPUT_NAMES = ("session.json", "requests.csv", "summary.csv")
+
 
 def _add_workload_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
@@ -447,23 +449,33 @@ def _run_canonical(args: argparse.Namespace) -> int:
             return
         if explicit_output_dir.exists() and not explicit_output_dir.is_dir():
             _fail(f"--output-dir is not a directory: {explicit_output_dir}")
-        names = ["session.json"]
-        if args.csv:
-            names.extend(["requests.csv", "summary.csv"])
-        _fail_if_outputs_exist([explicit_output_dir / name for name in names])
+        _fail_if_outputs_exist([
+            explicit_output_dir / name for name in _RESERVED_OUTPUT_NAMES
+        ])
 
     session = _execute_session(args, preflight=preflight)
     output_dir = explicit_output_dir or Path("llm-meter-runs") / session.session_id
     paths = [output_dir / "session.json"]
     if args.csv:
         paths.extend([output_dir / "requests.csv", output_dir / "summary.csv"])
-    _fail_if_outputs_exist(paths)
+    _fail_if_outputs_exist([output_dir / name for name in _RESERVED_OUTPUT_NAMES])
     output_dir.mkdir(parents=True, exist_ok=True)
 
     output_path = write_session(session, paths[0])
     if args.csv:
-        write_requests_csv(session, paths[1])
-        write_summary_csv(session, paths[2])
+        created_csv_paths: list[Path] = []
+        try:
+            created_csv_paths.append(write_requests_csv(session, paths[1]))
+            created_csv_paths.append(write_summary_csv(session, paths[2]))
+        except Exception:
+            for csv_path in created_csv_paths:
+                try:
+                    csv_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+            raise
 
     _print_session_summary(session, output_path)
     return 0 if session.status == "completed" else 1

@@ -152,6 +152,18 @@ def test_summary_csv_is_long_form_measured_only_and_deterministic(tmp_path: Path
 
     assert tuple(rows[0]) == SUMMARY_COLUMNS
     assert first.read_bytes() == second.read_bytes()
+    assert [
+        (row["section"], row["metric"], row["value"])
+        for row in rows[:3]
+    ] == [
+        ("metadata", "summary_version", session.summary.summary_version),
+        ("metadata", "phase", session.summary.phase),
+        ("metadata", "percentile_method", session.summary.percentile_method),
+    ]
+    assert all(row["unit"] == "" for row in rows[:3])
+    assert all(row["status"] == "" for row in rows[:3])
+    assert all(row["sample_count"] == "" for row in rows[:3])
+    assert all(row["sample_unit"] == "" for row in rows[:3])
     assert keyed[("attempts", "attempted")]["value"] == "3"
     assert keyed[("attempts", "completed")]["value"] == "1"
     assert keyed[("attempts", "error_rate")]["value"] == str(2 / 3)

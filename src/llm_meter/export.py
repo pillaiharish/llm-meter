@@ -147,6 +147,15 @@ def write_summary_csv(session: BenchmarkSession, path: str | Path) -> Path:
     session_id = session.session_id
     attempts = summary.attempts
     rows = [
+        _summary_row(session_id, "metadata", "summary_version", summary.summary_version, ""),
+        _summary_row(session_id, "metadata", "phase", summary.phase, ""),
+        _summary_row(
+            session_id,
+            "metadata",
+            "percentile_method",
+            summary.percentile_method,
+            "",
+        ),
         _summary_row(session_id, "attempts", "attempted", attempts.attempted, "count"),
         _summary_row(session_id, "attempts", "completed", attempts.completed, "count"),
         _summary_row(session_id, "attempts", "failed", attempts.failed, "count"),

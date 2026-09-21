@@ -393,7 +393,9 @@ llm-meter run \
 `--requests` is required. Warmup defaults to `0`, concurrency to `1`, and the
 seed to `0`. If `--output-dir` is omitted, artifacts are written under
 `./llm-meter-runs/<session-id>/`. Existing artifact files are never
-overwritten.
+overwritten. For an explicit output directory, `session.json`, `requests.csv`,
+and `summary.csv` are all reserved even without `--csv`; a stale projection
+from another session therefore blocks a new run. Unrelated files are allowed.
 
 Every successful benchmark writes `session.json`, the canonical lossless
 artifact. With `--csv`, two deterministic analysis views are also written:
@@ -408,6 +410,9 @@ artifact. With `--csv`, two deterministic analysis views are also written:
 CSV stores raw nanoseconds, rates, counts, and fractions with empty fields for
 unavailable values. It intentionally does not flatten environment provenance
 or preserve all raw observations. CSV is not the canonical artifact; JSON is.
+`summary.csv` begins with summary version, phase, and percentile-method
+metadata. If either CSV export fails, CSV files created by that attempt are
+removed while the completed canonical `session.json` remains available.
 
 `--prompt` and `--input-tokens` are mutually exclusive. `--input-tokens`
 requires `--tokenizer`. Manual `--prompt` may optionally specify `--tokenizer`
