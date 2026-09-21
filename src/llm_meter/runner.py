@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
@@ -10,9 +11,11 @@ from typing import Any, Protocol, runtime_checkable
 import httpx
 
 from llm_meter import __version__
+from llm_meter.environment import collect_environment
 from llm_meter.models import (
     BenchmarkPhase,
     BenchmarkSession,
+    EnvironmentProvenance,
     Provenance,
     SeedStrategy,
     SessionConfiguration,
@@ -225,6 +228,7 @@ async def run_session(
     api_key: str | None,
     tokenizer: Any = None,
     manual_prompt: str | None = None,
+    environment_collector: Callable[[], EnvironmentProvenance] = collect_environment,
 ) -> BenchmarkSession:
     plan.validate()
 
@@ -241,6 +245,7 @@ async def run_session(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
+    environment = environment_collector()
     session_id = str(uuid.uuid4())
     started_at = datetime.now(UTC).isoformat()
     session_origin_ns = time.perf_counter_ns()
@@ -289,6 +294,7 @@ async def run_session(
         configuration=configuration,
         requests=session_requests,
         provenance=Provenance(llm_meter_version=__version__),
+        environment=environment,
     )
     session.summary = summarize_session(session)
     return session

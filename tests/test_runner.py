@@ -10,9 +10,14 @@ import pytest
 from llm_meter.models import (
     BenchmarkPhase,
     BenchmarkRun,
+    EnvironmentProvenance,
+    NvidiaProvenance,
+    PackageVersions,
     Provenance,
+    PythonRuntimeProvenance,
     RunConfiguration,
     RunStatus,
+    SystemProvenance,
     TokenCountSource,
     Usage,
     WorkloadProvenance,
@@ -207,7 +212,19 @@ def _run(plan: BenchmarkPlan, executor: RequestExecutor, **kwargs: Any) -> Any:
             api_key=None,
             tokenizer=tok,
             manual_prompt=kwargs.get("manual_prompt"),
+            environment_collector=kwargs.get("environment_collector", _fake_environment),
         )
+    )
+
+
+def _fake_environment() -> EnvironmentProvenance:
+    return EnvironmentProvenance(
+        version="1",
+        captured_at_utc="2025-01-01T00:00:00+00:00",
+        system=SystemProvenance("python_platform", "TestOS", "1", "test64", 8),
+        python=PythonRuntimeProvenance("python_runtime", "3.12", "CPython"),
+        packages=PackageVersions("httpx-test", "tokenizers-test"),
+        nvidia=NvidiaProvenance("unavailable", "nvidia_smi", "nvidia_smi_not_found", []),
     )
 
 
@@ -245,6 +262,7 @@ def test_max_inflight_never_exceeds_concurrency() -> None:
                 model="test-model",
                 api_key=None,
                 tokenizer=_fake_tokenizer(),
+                environment_collector=_fake_environment,
             )
         )
         await asyncio.wait_for(started_event.wait(), timeout=5)
@@ -273,6 +291,7 @@ def test_concurrency_reaches_requested_value() -> None:
                 model="test-model",
                 api_key=None,
                 tokenizer=_fake_tokenizer(),
+                environment_collector=_fake_environment,
             )
         )
         await asyncio.wait_for(started_event.wait(), timeout=5)
@@ -611,7 +630,25 @@ async def _run_async(plan: BenchmarkPlan, executor: RequestExecutor) -> Any:
         model="test-model",
         api_key=None,
         tokenizer=_fake_tokenizer(),
+        environment_collector=_fake_environment,
     )
+
+
+def test_environment_collected_once_before_requests() -> None:
+    events: list[str] = []
+
+    def collector() -> EnvironmentProvenance:
+        events.append("environment")
+        return _fake_environment()
+
+    class EventExecutor(SyncExecutor):
+        async def __call__(self, *args: Any, **kwargs: Any) -> BenchmarkRun:
+            events.append("request")
+            return await super().__call__(*args, **kwargs)
+
+    _run(_make_plan(warmup=2, measured=3), EventExecutor(), environment_collector=collector)
+
+    assert events == ["environment", "request", "request", "request", "request", "request"]
 
 
 def test_executor_raises_concurrency_1_raises_promptly() -> None:

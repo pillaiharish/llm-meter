@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 from llm_meter import __version__
+from llm_meter.environment import ENVIRONMENT_PROVENANCE_VERSION
 from llm_meter.metrics import derive_metrics
 from llm_meter.models import (
     AttemptSummary,
@@ -15,8 +16,13 @@ from llm_meter.models import (
     ClientMetrics,
     Completion,
     DistributionSummary,
+    EnvironmentProvenance,
     ErrorObservation,
+    NvidiaDeviceProvenance,
+    NvidiaProvenance,
+    PackageVersions,
     Provenance,
+    PythonRuntimeProvenance,
     RawObservations,
     RequestStart,
     ResponseEstablished,
@@ -26,6 +32,7 @@ from llm_meter.models import (
     SessionRequest,
     SessionSummary,
     StreamEvent,
+    SystemProvenance,
     ThroughputSummary,
     TokenCountSource,
     Usage,
@@ -48,6 +55,10 @@ _SENSITIVE_QUERY_PARAMS = frozenset({
 
 
 class UnsupportedSchemaVersion(Exception):
+    pass
+
+
+class UnsupportedEnvironmentProvenanceVersion(Exception):
     pass
 
 
@@ -339,6 +350,7 @@ def session_to_json(session: BenchmarkSession) -> str:
             for req in session.requests
         ],
         "provenance": {"llm_meter_version": session.provenance.llm_meter_version},
+        "environment": dataclass_to_dict(session.environment),
         "summary": dataclass_to_dict(session.summary),
     }
     return json.dumps(data, indent=2, sort_keys=False, ensure_ascii=False)
@@ -404,6 +416,12 @@ def _dict_to_session(obj: dict[str, Any]) -> BenchmarkSession:
     )
 
     summary = _dict_to_summary(obj["summary"]) if obj.get("summary") else None
+    environment_data = obj.get("environment")
+    environment = (
+        _dict_to_environment(environment_data)
+        if "environment" in obj and environment_data is not None
+        else None
+    )
 
     return BenchmarkSession(
         schema_version=obj["schema_version"],
@@ -415,6 +433,60 @@ def _dict_to_session(obj: dict[str, Any]) -> BenchmarkSession:
         requests=requests,
         provenance=provenance,
         summary=summary,
+        environment=environment,
+    )
+
+
+def _dict_to_environment(obj: dict[str, Any]) -> EnvironmentProvenance:
+    encountered = obj.get("version")
+    if encountered is None:
+        raise UnsupportedEnvironmentProvenanceVersion(
+            f"missing environment version; expected {ENVIRONMENT_PROVENANCE_VERSION!r}"
+        )
+    if encountered != ENVIRONMENT_PROVENANCE_VERSION:
+        raise UnsupportedEnvironmentProvenanceVersion(
+            "unsupported environment provenance version: "
+            f"expected {ENVIRONMENT_PROVENANCE_VERSION!r}, got {encountered!r}"
+        )
+
+    system = obj["system"]
+    python = obj["python"]
+    packages = obj["packages"]
+    nvidia = obj["nvidia"]
+    return EnvironmentProvenance(
+        version=encountered,
+        captured_at_utc=obj["captured_at_utc"],
+        system=SystemProvenance(
+            source=system["source"],
+            os_name=system["os_name"],
+            os_release=system["os_release"],
+            architecture=system["architecture"],
+            logical_cpu_count=system.get("logical_cpu_count"),
+        ),
+        python=PythonRuntimeProvenance(
+            source=python["source"],
+            version=python["version"],
+            implementation=python["implementation"],
+        ),
+        packages=PackageVersions(
+            httpx=packages.get("httpx"),
+            tokenizers=packages.get("tokenizers"),
+        ),
+        nvidia=NvidiaProvenance(
+            status=nvidia["status"],
+            source=nvidia["source"],
+            reason=nvidia.get("reason"),
+            devices=[
+                NvidiaDeviceProvenance(
+                    index=device["index"],
+                    name=device["name"],
+                    uuid=device.get("uuid"),
+                    memory_total_mib=device.get("memory_total_mib"),
+                    driver_version=device.get("driver_version"),
+                )
+                for device in nvidia.get("devices", [])
+            ],
+        ),
     )
 
 
