@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from llm_meter.artifact import (
     SESSION_SCHEMA_VERSION,
+    UnsupportedEnvironmentProvenanceVersion,
     session_from_json,
     session_to_json,
     write_session,
@@ -12,8 +15,13 @@ from llm_meter.artifact import (
 from llm_meter.models import (
     BenchmarkRun,
     BenchmarkSession,
+    EnvironmentProvenance,
+    NvidiaProvenance,
+    PackageVersions,
     Provenance,
+    PythonRuntimeProvenance,
     RunConfiguration,
+    SystemProvenance,
     TokenCountSource,
     Usage,
     WorkloadProvenance,
@@ -112,7 +120,19 @@ def _make_session() -> BenchmarkSession:
             model="test-model",
             api_key=None,
             tokenizer=tok,
+            environment_collector=_fake_environment,
         )
+    )
+
+
+def _fake_environment() -> EnvironmentProvenance:
+    return EnvironmentProvenance(
+        version="1",
+        captured_at_utc="2025-01-01T00:00:00+00:00",
+        system=SystemProvenance("python_platform", "TestOS", "1", "test64", 8),
+        python=PythonRuntimeProvenance("python_runtime", "3.12", "CPython"),
+        packages=PackageVersions("0.28.1", "0.21.4"),
+        nvidia=NvidiaProvenance("unavailable", "nvidia_smi", "nvidia_smi_not_found", []),
     )
 
 
@@ -169,6 +189,42 @@ def test_session_json_round_trip() -> None:
     assert restored.configuration.concurrency == 2
     assert restored.configuration.endpoint == "http://localhost:8000/v1"
     assert restored.configuration.model == "test-model"
+    assert restored.environment == session.environment
+
+
+def test_old_session_without_environment_deserializes_as_none() -> None:
+    data = json.loads(session_to_json(_make_session()))
+    del data["environment"]
+
+    restored = session_from_json(json.dumps(data))
+
+    assert restored.environment is None
+
+
+def test_present_environment_requires_supported_version() -> None:
+    data = json.loads(session_to_json(_make_session()))
+    del data["environment"]["version"]
+
+    with pytest.raises(UnsupportedEnvironmentProvenanceVersion, match="missing environment"):
+        session_from_json(json.dumps(data))
+
+    data["environment"]["version"] = "999"
+    with pytest.raises(UnsupportedEnvironmentProvenanceVersion, match="unsupported environment"):
+        session_from_json(json.dumps(data))
+
+    data["environment"] = {}
+    with pytest.raises(UnsupportedEnvironmentProvenanceVersion, match="missing environment"):
+        session_from_json(json.dumps(data))
+
+
+def test_environment_does_not_change_summary_or_nested_runs() -> None:
+    session = _make_session()
+    with_environment = json.loads(session_to_json(session))
+    session.environment = None
+    without_environment = json.loads(session_to_json(session))
+
+    assert with_environment["summary"] == without_environment["summary"]
+    assert with_environment["requests"] == without_environment["requests"]
 
 
 def test_benchmark_run_json_backward_compatible() -> None:

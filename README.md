@@ -194,26 +194,41 @@ provenance is explicit and reproducible.
 
 ### Environment provenance
 
-The eventual benchmark artifact should capture:
+Each benchmark session records a versioned description of the environment
+directly visible to the `llm-meter` process. It includes the client operating
+system and architecture, logical CPU count, Python version and implementation,
+the installed `httpx` and `tokenizers` versions, and optional static NVIDIA
+device identity obtained from local `nvidia-smi`.
 
-- model
-- model revision where available
-- tokenizer
-- inference engine
-- engine version
-- engine startup arguments
-- GPU model
-- GPU count
-- GPU memory
-- NVIDIA driver
-- CUDA runtime/toolkit where available
-- PyTorch version where relevant
-- operating system
-- container image
-- git SHA
-- llm-meter version
+The observation boundary matters. For this topology:
 
-Benchmark provenance is part of the measurement, not optional metadata. A throughput number detached from the environment and workload that produced it is not a reproducible result.
+```text
+Mac llm-meter
+      │
+      ▼
+remote H100 vLLM
+```
+
+the environment block describes the Mac, not the remote H100 server. Absence
+of local `nvidia-smi` is recorded as a successful `unavailable` observation.
+To capture local NVIDIA device metadata, run `llm-meter` on the GPU host or in
+a container where `nvidia-smi` is visible. No SSH, remote shell, provider API,
+or inference-server introspection is performed.
+
+The collector intentionally excludes hostnames, usernames, home and working
+directories, network addresses, environment variables, and filesystem paths.
+It does not promise anonymity; it limits collection to fields relevant to
+reproducibility.
+
+`nvidia-smi`'s displayed `CUDA Version` is not recorded. That value describes
+the driver's supported CUDA compatibility level, not necessarily the CUDA
+runtime used by a remote or containerized serving process. CUDA runtime,
+toolkit, framework, and serving-engine provenance require direct, explicitly
+identified sources and remain future work.
+
+Continuous GPU telemetry such as utilization, memory usage, power, and
+temperature is also future work. This session metadata is static provenance,
+not telemetry.
 
 ---
 
@@ -331,9 +346,14 @@ The first engine-specific integration can target vLLM benchmarking while retaini
 - **serialize a `BenchmarkSession` artifact** — the session artifact contains
   the execution plan, all per-request `BenchmarkRun` objects, and orchestration
   timing offsets.
+- **summarize measured requests** — session artifacts include percentile,
+  throughput, and error-rate summaries derived only from the measured phase.
+- **record local environment provenance** — one session-level block captures
+  the process-visible client system, Python runtime, direct dependency
+  versions, and optional local NVIDIA device identity.
 
-This is an experimental multi-request capability. Percentile aggregation,
-throughput summaries, and GPU telemetry are not yet implemented.
+This is an experimental multi-request capability. Continuous GPU telemetry is
+not yet implemented.
 
 ### Usage
 
@@ -911,13 +931,12 @@ Implemented:
 - controlled concurrency
 - per-request `BenchmarkRun` preservation
 - `BenchmarkSession` artifact
+- measured-phase percentile, throughput, and error-rate summary
+- local client/runtime environment provenance
+- optional local NVIDIA device identity through `nvidia-smi`
 
 Still planned:
 
-- percentile aggregation (p50, p90, p95, p99)
-- aggregate throughput
-- error-rate summary
-- environment/GPU provenance
 - CSV export
 - run-to-run comparison
 - GPU telemetry

@@ -48,6 +48,12 @@ class SeedStrategy(StrEnum):
     BASE_PLUS_GLOBAL_ORDINAL = "base_plus_global_ordinal"
 
 
+class CollectionStatus(StrEnum):
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    ERROR = "error"
+
+
 @dataclass
 class RequestStart:
     offset_ns: int
@@ -113,6 +119,55 @@ class ClientMetrics:
 @dataclass
 class Provenance:
     llm_meter_version: str
+
+
+@dataclass
+class SystemProvenance:
+    source: str
+    os_name: str
+    os_release: str
+    architecture: str
+    logical_cpu_count: int | None
+
+
+@dataclass
+class PythonRuntimeProvenance:
+    source: str
+    version: str
+    implementation: str
+
+
+@dataclass
+class PackageVersions:
+    httpx: str | None
+    tokenizers: str | None
+
+
+@dataclass
+class NvidiaDeviceProvenance:
+    index: int
+    name: str
+    uuid: str | None
+    memory_total_mib: int | None
+    driver_version: str | None
+
+
+@dataclass
+class NvidiaProvenance:
+    status: str
+    source: str
+    reason: str | None
+    devices: list[NvidiaDeviceProvenance]
+
+
+@dataclass
+class EnvironmentProvenance:
+    version: str
+    captured_at_utc: str
+    system: SystemProvenance
+    python: PythonRuntimeProvenance
+    packages: PackageVersions
+    nvidia: NvidiaProvenance
 
 
 @dataclass
@@ -243,6 +298,7 @@ class BenchmarkSession:
     requests: list[SessionRequest]
     provenance: Provenance
     summary: SessionSummary | None = None
+    environment: EnvironmentProvenance | None = None
 
     @property
     def warmup_runs(self) -> list[SessionRequest]:
