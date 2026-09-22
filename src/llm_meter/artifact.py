@@ -359,7 +359,8 @@ def session_to_json(session: BenchmarkSession) -> str:
 def write_session(session: BenchmarkSession, path: str | Path) -> Path:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(session_to_json(session) + "\n", encoding="utf-8")
+    with output_path.open("x", encoding="utf-8") as output:
+        output.write(session_to_json(session) + "\n")
     return output_path
 
 
